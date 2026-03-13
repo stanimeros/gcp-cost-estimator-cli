@@ -318,8 +318,8 @@ build_report_data() {
         get_quota_for_service "$api_service"
         local quota_json="${quota_result:-[]}"
 
-        # Get first/main quota value, name, and unit: support QuotaInfo format (metricUnit for unit matching)
-        local quota_val quota_name quota_unit
+        # Get first/main quota value, name, unit, and refreshInterval (per day/minute): support QuotaInfo format
+        local quota_val quota_name quota_unit refresh_interval
         quota_val=$(echo "$quota_json" | jq -r '
             [.[]? | select(.dimensionsInfos[]?.details.value? != null and .dimensionsInfos[]?.details.value? != "") |
              .dimensionsInfos[0].details.value | tostring] | if length > 0 then .[0] else "" end
@@ -332,6 +332,19 @@ build_report_data() {
             [.[]? | select(.dimensionsInfos[]?.details.value? != null and .dimensionsInfos[]?.details.value? != "") |
              .metricUnit // ""] | if length > 0 then .[0] else "" end
         ' 2>/dev/null)
+        refresh_interval=$(echo "$quota_json" | jq -r '
+            [.[]? | select(.dimensionsInfos[]?.details.value? != null and .dimensionsInfos[]?.details.value? != "") |
+             .refreshInterval // ""] | if length > 0 then .[0] else "" end
+        ' 2>/dev/null)
+        # Append " (per minute/day/second)" to quota name when refreshInterval is present
+        if [[ -n "$refresh_interval" ]]; then
+            case "$refresh_interval" in
+                minute) quota_name="${quota_name} (per minute)" ;;
+                day) quota_name="${quota_name} (per day)" ;;
+                second) quota_name="${quota_name} (per second)" ;;
+                *) quota_name="${quota_name} (per ${refresh_interval})" ;;
+            esac
+        fi
         # GCP uses -1 or 9223372036854775807 (2^63-1) for unlimited quotas
         [[ "$quota_val" = "-1" ]] && quota_val="unlimited"
         [[ "$quota_val" = "9223372036854775807" ]] && quota_val="unlimited"
@@ -370,7 +383,7 @@ build_report_data() {
                     *) est_daily=$(echo "scale=2; $unit_price * ${quota_val}" | bc 2>/dev/null || echo "?") ;;
                 esac
             else
-                est_daily="unlimited"
+                est_daily="N/A"
             fi
 
             # Unit match: Quota (By/GiBy) + SKU (GiBy.mo) = Match. Quota (Requests) + SKU (Storage) = N/A
@@ -399,10 +412,8 @@ build_report_data() {
             fi
             [[ -z "$suggested_quota" ]] && suggested_quota="-"
 
-            # Track best est_daily (unlimited takes precedence; else first numeric) and best_suggested (min = from most expensive SKU)
-            if [[ "$est_daily" = "unlimited" ]]; then
-                best_est_daily="unlimited"
-            elif [[ "$best_est_daily" != "unlimited" ]] && [[ "$est_daily" != "N/A" && "$est_daily" != "" && "$est_daily" != "?" ]]; then
+            # Track best est_daily (first numeric wins) and best_suggested (min = from most expensive SKU)
+            if [[ "$est_daily" != "N/A" && "$est_daily" != "" && "$est_daily" != "?" ]]; then
                 [[ "$best_est_daily" = "N/A" ]] && best_est_daily="$est_daily"
             fi
             # Suggested from most expensive SKU (highest unit_price → lowest suggested) = safest budget limit
@@ -419,7 +430,11 @@ build_report_data() {
         report_skus=$((report_skus + ${#sku_descs[@]}))
         local sku_combined
         sku_combined=$(IFS=', '; echo "${sku_descs[*]}")
-        [[ "$quota_val" = "unlimited" && "$best_est_daily" = "N/A" ]] && best_est_daily="unlimited"
+        # Truncate SKU list with ellipsis after 80 chars for readability
+        if [[ ${#sku_combined} -gt 80 ]]; then
+            sku_combined="${sku_combined:0:77}..."
+        fi
+        # When quota is unlimited, est stays N/A (no cost estimate possible)
         [[ -z "$quota_name" ]] && quota_name="Quota"
         rows="${rows}
 ${api_service}|${quota_name}|${sku_combined}|${quota_val:-N/A}|${best_suggested:-}|${best_est_daily:-N/A}|0|"
