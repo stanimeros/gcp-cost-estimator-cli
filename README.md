@@ -13,6 +13,8 @@ Shell script that uses Google Cloud CLI and Cloud Billing API to create a table 
 
 ```bash
 ./gcloud-quota-billing-report.sh 500
+# Prompts for project ID if not provided
+
 ./gcloud-quota-billing-report.sh 1000 my-project-id
 
 # Fast run without quota (SKIP_QUOTA=1)

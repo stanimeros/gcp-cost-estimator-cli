@@ -6,6 +6,7 @@
 #
 # Usage:
 #   ./gcloud-quota-billing-report.sh [TARGET_BUDGET_USD] [PROJECT_ID]
+#   If PROJECT_ID is omitted, prompts interactively for project selection.
 #
 
 set -euo pipefail
@@ -73,7 +74,22 @@ check_prerequisites() {
         exit 1
     fi
     if [[ -z "$PROJECT_ID" ]]; then
-        PROJECT_ID=$(gcloud config get-value project 2>/dev/null || true)
+        local default_project
+        default_project=$(gcloud config get-value project 2>/dev/null || true)
+        if [[ -t 0 ]]; then
+            echo ""
+            log_info "Available projects:"
+            gcloud projects list --format="table(projectId,name)" 2>/dev/null | head -20
+            echo ""
+            if [[ -n "$default_project" ]]; then
+                read -p "Enter project ID [${default_project}]: " PROJECT_ID
+            else
+                read -p "Enter project ID: " PROJECT_ID
+            fi
+            PROJECT_ID=$(echo "${PROJECT_ID:-$default_project}" | tr -d '[:space:]')
+        else
+            PROJECT_ID="$default_project"
+        fi
         [[ -z "$PROJECT_ID" ]] && { log_error "Project not found."; exit 1; }
         log_info "Project: $PROJECT_ID"
     fi
@@ -235,6 +251,7 @@ build_report_data() {
             [.. | .consumerQuotaLimits? | select(. != null) | .[] | .quotaBuckets[0].effectiveLimit // empty] |
             map(select(. != null)) | if length > 0 then (.[0] | tostring) else "" end
         ' 2>/dev/null)
+        [[ "$quota_val" = "-1" ]] && quota_val="unlimited"
 
         # Process top SKUs (limit to avoid huge output)
         local idx=0
@@ -256,7 +273,7 @@ build_report_data() {
             local est_daily=""
             local suggested_quota=""
             local do_calc="no"
-            [[ -n "$quota_val" && "$quota_val" != "N/A" ]] && do_calc="yes"
+            [[ -n "$quota_val" && "$quota_val" != "N/A" && "$quota_val" != "unlimited" ]] && do_calc="yes"
             # usage_unit: h=hourly, GiBy/By=storage, request/1000=per-request APIs (Maps, Vision, etc.)
             if [[ "$do_calc" = "yes" ]]; then
                 case "$usage_unit" in
