@@ -112,31 +112,54 @@ TMP_QUOTA_CACHE=""   # quota JSON object for current project
 TMP_BILLING=""       # billing services catalog
 
 # --- Get All Quotas: fetch per-service into TMP_QUOTA_CACHE file.
-# Skips services already present in the file (cache hit = no gcloud call).
+# TMP_QUOTA_CACHE must be pre-loaded with persistent cache from ${CACHE_DIR}/quota_${PROJECT_ID}_all.json.
+# Fetches only missing services in parallel (up to PARALLEL_QUOTA_JOBS).
 # Usage: fetch_all_quotas PROJECT_ID SERVICE1 SERVICE2 ...
+PARALLEL_QUOTA_JOBS="${PARALLEL_QUOTA_JOBS:-8}"
 fetch_all_quotas() {
     local project_id="$1"; shift
     local services=("${@+"$@"}")
-    local tmp_new
-    tmp_new=$(mktemp)
+    local missing=()
     for svc in "${services[@]+"${services[@]}"}"; do
         [[ -z "$svc" ]] && continue
-        # Skip if already in cache file
-        if jq -e --arg s "$svc" 'has($s)' "$TMP_QUOTA_CACHE" &>/dev/null; then
-            continue
-        fi
-        local data
-        if command -v timeout &>/dev/null; then
-            data=$(timeout 30 gcloud beta quotas info list --service="$svc" --project="$project_id" --format="json" 2>&1)
-        else
-            data=$(gcloud beta quotas info list --service="$svc" --project="$project_id" --format="json" 2>&1)
-        fi
-        if [[ -n "$data" ]] && echo "$data" | jq -e 'type == "array" and length > 0' &>/dev/null; then
-            jq -c --arg s "$svc" --argjson d "$data" '.[$s] = $d' "$TMP_QUOTA_CACHE" > "$tmp_new" 2>/dev/null \
-                && mv "$tmp_new" "$TMP_QUOTA_CACHE"
+        if ! jq -e --arg s "$svc" 'has($s)' "$TMP_QUOTA_CACHE" &>/dev/null; then
+            missing+=("$svc")
         fi
     done
+    [[ ${#missing[@]} -eq 0 ]] && return 0
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    # Fetch missing services in parallel; each writes JSON to ${tmpdir}/${svc}.json
+    for svc in "${missing[@]}"; do
+        (
+            local data
+            if command -v timeout &>/dev/null; then
+                data=$(timeout 30 gcloud beta quotas info list --service="$svc" --project="$project_id" --format="json" 2>/dev/null)
+            else
+                data=$(gcloud beta quotas info list --service="$svc" --project="$project_id" --format="json" 2>/dev/null)
+            fi
+            if [[ -n "$data" ]] && echo "$data" | jq -e 'type == "array" and length > 0' &>/dev/null; then
+                printf '%s' "$data" > "${tmpdir}/${svc}.json"
+            fi
+        ) &
+    done
+    wait
+
+    # Merge fetched results into TMP_QUOTA_CACHE (sequential merge is fast)
+    local tmp_new
+    tmp_new=$(mktemp)
+    for svc in "${missing[@]}"; do
+        [[ -f "${tmpdir}/${svc}.json" ]] || continue
+        local data
+        data=$(cat "${tmpdir}/${svc}.json" 2>/dev/null)
+        [[ -z "$data" ]] && continue
+        jq -c --arg s "$svc" --argjson d "$data" '.[$s] = $d' "$TMP_QUOTA_CACHE" > "$tmp_new" 2>/dev/null \
+            && mv "$tmp_new" "$TMP_QUOTA_CACHE"
+    done
     rm -f "$tmp_new"
+    rm -rf "$tmpdir"
 }
 
 # --- Get quota for service from TMP_QUOTA_CACHE file ---
@@ -322,30 +345,35 @@ build_report_data() {
             # Quota per $10/day: how many units $10 buys per day (based purely on SKU price+unit)
             # usageUnit values seen in practice: h, GiBy, GiBy.mo, GiBy.h, GiBy.s, GiBy.d,
             #   TiBy, MiBy, GBy.h, count, mo, min, s, ms, request, 1000, 1k
+            # Use bc -l for floating point; printf "%.0f" rounds to integer for validation.
             local quota_per_10=""
             if [[ -n "$unit_price" && "$unit_price" != "0" ]]; then
+                local raw_val=""
                 local u="$usage_unit"
                 case "$u" in
-                    h|*Hour*)            quota_per_10=$(echo "scale=0; 10 / ($unit_price * 24)" | bc 2>/dev/null) ;;       # per hour → hours/day
-                    GiBy.mo|TiBy.mo|MiBy.mo|mo) quota_per_10=$(echo "scale=0; 10 * 30 / $unit_price" | bc 2>/dev/null) ;;  # per month → $10/day = $300/mo
-                    GiBy.h|GBy.h)        quota_per_10=$(echo "scale=0; 10 / ($unit_price * 24)" | bc 2>/dev/null) ;;       # per GiBy-hour → GiBy that fit in $10/day
-                    GiBy.s|GBy.s)        quota_per_10=$(echo "scale=0; 10 / ($unit_price * 86400)" | bc 2>/dev/null) ;;    # per GiBy-second
-                    GiBy.d)              quota_per_10=$(echo "scale=0; 10 / $unit_price" | bc 2>/dev/null) ;;              # per GiBy-day
-                    GiBy|GBy)            quota_per_10=$(echo "scale=0; 10 * 30 / $unit_price" | bc 2>/dev/null) ;;         # per GiBy (storage, monthly)
-                    TiBy)                quota_per_10=$(echo "scale=0; 10 * 30 / $unit_price" | bc 2>/dev/null) ;;         # per TiBy
-                    MiBy)                quota_per_10=$(echo "scale=0; 10 * 30 * 1024 / $unit_price" | bc 2>/dev/null) ;;  # per MiBy → more units
-                    min)                 quota_per_10=$(echo "scale=0; 10 / ($unit_price * 1440)" | bc 2>/dev/null) ;;     # per minute → minutes/day
-                    s|ms)                quota_per_10=$(echo "scale=0; 10 / ($unit_price * 86400)" | bc 2>/dev/null) ;;    # per second
-                    count|1)             quota_per_10=$(echo "scale=0; 10 / $unit_price" | bc 2>/dev/null) ;;              # per item/count
-                    *request*|*1000*|*1k*) quota_per_10=$(echo "scale=0; 10 * 1000 / $unit_price" | bc 2>/dev/null) ;;    # per 1000 requests
-                    *)                   quota_per_10=$(echo "scale=0; 10 / $unit_price" | bc 2>/dev/null) ;;              # fallback
+                    h|*Hour*)            raw_val=$(echo "10 / ($unit_price * 24)" | bc -l 2>/dev/null) ;;
+                    GiBy.mo|TiBy.mo|MiBy.mo|mo) raw_val=$(echo "300 / $unit_price" | bc -l 2>/dev/null) ;;  # $10/day = $300/mo
+                    GiBy.h|GBy.h)        raw_val=$(echo "10 / ($unit_price * 24)" | bc -l 2>/dev/null) ;;
+                    GiBy.s|GBy.s)        raw_val=$(echo "10 / ($unit_price * 86400)" | bc -l 2>/dev/null) ;;
+                    GiBy.d)              raw_val=$(echo "10 / $unit_price" | bc -l 2>/dev/null) ;;
+                    GiBy|GBy)            raw_val=$(echo "300 / $unit_price" | bc -l 2>/dev/null) ;;         # storage, monthly
+                    TiBy)                raw_val=$(echo "300 / $unit_price" | bc -l 2>/dev/null) ;;
+                    MiBy)                raw_val=$(echo "300 * 1024 / $unit_price" | bc -l 2>/dev/null) ;;  # MiBy.mo → more units
+                    min)                 raw_val=$(echo "10 / ($unit_price * 1440)" | bc -l 2>/dev/null) ;;
+                    s|ms)                raw_val=$(echo "10 / ($unit_price * 86400)" | bc -l 2>/dev/null) ;;
+                    count|1)             raw_val=$(echo "10 / $unit_price" | bc -l 2>/dev/null) ;;
+                    *request*|*1000*|*1k*) raw_val=$(echo "10 * 1000 / $unit_price" | bc -l 2>/dev/null) ;;
+                    *)                   raw_val=$(echo "10 / $unit_price" | bc -l 2>/dev/null) ;;
                 esac
+                # Round to integer; handles .45, 0.45, 1e5, etc.
+                if [[ -n "$raw_val" ]]; then
+                    quota_per_10=$(printf "%.0f" "$raw_val" 2>/dev/null || echo "")
+                fi
             fi
             quota_per_10=$(echo "$quota_per_10" | tr -d ' \n\r')
             [[ -z "$quota_per_10" || "$quota_per_10" = "0" ]] && quota_per_10="N/A"
 
             # quota_per_10 from most expensive SKU (lowest value = tightest budget)
-            # Accept integers; strip decimals (bc can output 27272.000)
             local q10_int
             q10_int=$(echo "$quota_per_10" | sed 's/^\([0-9]*\).*/\1/' | tr -d '\n')
             if [[ -n "$q10_int" && "$q10_int" =~ ^[0-9]+$ && "$q10_int" -gt 0 ]]; then
@@ -390,7 +418,7 @@ sort_rows() {
         local sortkey_quota="0"
         [[ "$quota" = "unlimited" ]] && sortkey_quota="9223372036854775807"
         [[ "$quota" =~ ^[0-9]+$ ]] && sortkey_quota="$quota"
-        printf '%s|%s|%s|%s|%s|%s|\n' "$sortkey" "$sortkey_quota" "$svc" "$qname" "$sku" "$quota" "$qper10"
+        printf '%s|%s|%s|%s|%s|%s|%s\n' "$sortkey" "$sortkey_quota" "$svc" "$qname" "$sku" "$quota" "$qper10"
     done | sort -t'|' -k1 -n -k2 -rn 2>/dev/null | cut -d'|' -f3-)
     echo "$sorted"
 }
