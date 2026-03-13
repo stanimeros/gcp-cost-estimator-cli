@@ -1,6 +1,6 @@
 # GCP Quota & Billing Report
 
-Shell script that uses Google Cloud CLI and Cloud Billing API to create a report with **enabled billable services** across all accessible GCP projects, showing quotas, SKUs, estimated daily cost, and how many quota units $10/day buys.
+Shell script that uses Google Cloud CLI and Cloud Billing API to create a report with **enabled billable services** across all accessible GCP projects, showing quotas, SKUs, and how many quota units $10/day buys.
 
 ## Requirements
 
@@ -19,8 +19,8 @@ The script automatically processes **all accessible GCP projects** (from `gcloud
 
 ## Output
 
-- **Terminal**: Table sorted by Est. Price Daily (higher first)
-- **File** (`billing-report.md`): Full markdown report with summary stats (overwrites each run)
+- **Terminal**: One table per project, sorted by Quota per $10/day (most expensive first)
+- **File** (`billing-report.md`): One markdown table per project, plus a total summary footer (overwrites each run)
 
 ## Report Summary
 
@@ -39,11 +39,10 @@ The report header shows:
 | SKU(s) | Billing SKU descriptions for the service, truncated with ellipsis (…) after 80 chars |
 | Current quota | Current quota value (or `unlimited` when applicable) |
 | Quota per $10/day | How many quota units $10/day buys (from most expensive SKU), or **N/A** when not estimable |
-| Est. price daily | Estimated daily cost at full quota usage, or **N/A** when not estimable |
 
-## When Quota per $10/day and Est. Price Daily are N/A
+## When Quota per $10/day is N/A
 
-The values are shown as **N/A** when:
+The value is shown as **N/A** when:
 
 - **Unlimited quota** – no numeric limit to base calculation on
 - **Unit mismatch** – Quota unit (e.g. Requests) does not match SKU unit (e.g. Storage GiB)

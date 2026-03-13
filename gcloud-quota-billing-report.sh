@@ -108,11 +108,11 @@ billing_get_skus() {
     echo "$result"
 }
 
-# --- Get All Quotas: fetch per-service (gcloud beta quotas info list --service= was removed) ---
-# Uses gcloud beta quotas info list --service=X per service. Populates global quota_bulk_cache.
+# --- Get All Quotas: fetch per-service. Populates global quota_bulk_cache.
 # Preserves existing cached entries when gcloud fails for a service.
-# Usage: fetch_all_quotas SERVICE1 SERVICE2 ...
+# Usage: fetch_all_quotas PROJECT_ID SERVICE1 SERVICE2 ...
 fetch_all_quotas() {
+    local project_id="$1"; shift
     local services=("$@")
     # Start with existing cache so we keep data when gcloud fails
     local merged="${quota_bulk_cache:-{}}"
@@ -121,9 +121,9 @@ fetch_all_quotas() {
         [[ -z "$svc" ]] && continue
         local data
         if command -v timeout &>/dev/null; then
-            data=$(timeout 30 gcloud beta quotas info list --service="$svc" --project="$PROJECT_ID" --format="json" 2>&1)
+            data=$(timeout 30 gcloud beta quotas info list --service="$svc" --project="$project_id" --format="json" 2>&1)
         else
-            data=$(gcloud beta quotas info list --service="$svc" --project="$PROJECT_ID" --format="json" 2>&1)
+            data=$(gcloud beta quotas info list --service="$svc" --project="$project_id" --format="json" 2>&1)
         fi
         # Only merge when gcloud returns a non-empty array; preserve cached data when gcloud returns [] or fails
         if [[ -n "$data" ]] && echo "$data" | jq -e 'type == "array" and length > 0' &>/dev/null; then
@@ -207,14 +207,6 @@ units_compatible() {
     return 0
 }
 
-# --- Parse quota value from quota JSON ---
-get_quota_value() {
-    local quota_json="$1"
-    echo "$quota_json" | jq -r '
-        [.consumerQuotaLimits[]? | .quotaBuckets[0].effectiveLimit // empty] |
-        if length > 0 then (.[0] | tostring) else "" end
-    ' 2>/dev/null
-}
 
 # --- Main: build report data for a single project ---
 # Usage: build_report_data PROJECT_ID
@@ -269,7 +261,7 @@ build_report_data() {
     fi
     [[ -z "$quota_bulk_cache" || "$quota_bulk_cache" = "null" ]] && quota_bulk_cache="{}"
     [[ "$quota_bulk_cache" = "" ]] && quota_bulk_cache="{}"
-    fetch_all_quotas "${services_to_process[@]}"
+    fetch_all_quotas "$PROJECT_ID" "${services_to_process[@]}"
 
     for i in "${!enabled_services[@]}"; do
         local api_service="${enabled_services[$i]}"
@@ -340,7 +332,6 @@ build_report_data() {
 
         # Aggregate SKUs per service
         local sku_descs=()
-        local best_est_daily="N/A"
         # quota_per_10: units you can consume for $10/day (from most expensive SKU)
         local best_quota_per_10="N/A"
         local idx=0
@@ -360,37 +351,12 @@ build_report_data() {
 
             sku_descs+=("$sku_desc")
 
-            # Estimate daily cost at current quota
-            local est_daily=""
-            local do_calc="no"
-            [[ -n "$quota_val" && "$quota_val" != "N/A" && "$quota_val" != "unlimited" ]] && do_calc="yes"
-            if [[ "$do_calc" = "yes" ]]; then
-                case "$usage_unit" in
-                    *h|*Hour*) est_daily=$(echo "scale=2; $unit_price * 24 * ${quota_val}" | bc 2>/dev/null || echo "?") ;;
-                    *GiBy|*By|*GB*) est_daily=$(echo "scale=2; $unit_price * ${quota_val} / 30" | bc 2>/dev/null || echo "?") ;;
-                    *request*|*1000*|*1k*) est_daily=$(echo "scale=2; $unit_price * ${quota_val} / 1000 / 30" | bc 2>/dev/null || echo "?") ;;
-                    *) est_daily=$(echo "scale=2; $unit_price * ${quota_val}" | bc 2>/dev/null || echo "?") ;;
-                esac
-            else
-                est_daily="N/A"
-            fi
-
-            if [[ "$do_calc" = "yes" ]] && ! units_compatible "${quota_unit:-}" "${quota_name:-}" "$usage_unit"; then
-                est_daily="N/A"
-            fi
             local qname_lower
             qname_lower=$(echo "${quota_name:-}" | tr '[:upper:]' '[:lower:]')
-            if [[ "$qname_lower" = *"request"* || "$qname_lower" = *"per minute"* || "$qname_lower" = *"per second"* || "$qname_lower" = *"createcapacity"* ]]; then
-                [[ "$do_calc" = "yes" ]] && est_daily="N/A"
-            fi
-            if [[ "$est_daily" =~ ^[0-9.]+$ ]] && (( $(echo "$est_daily > 100000" | bc 2>/dev/null || echo 0) )); then
-                est_daily="N/A"
-            fi
 
-            # Quota per $10/day: how many units $10 buys per day (using same unit conversion as est_daily)
+            # Quota per $10/day: how many units $10 buys per day
             local quota_per_10=""
             if [[ -n "$unit_price" && "$unit_price" != "0" ]]; then
-                # Only compute when units are compatible (same logic as est_daily)
                 local compatible="yes"
                 ! units_compatible "${quota_unit:-}" "${quota_name:-}" "$usage_unit" && compatible="no"
                 [[ "$qname_lower" = *"request"* || "$qname_lower" = *"per minute"* || "$qname_lower" = *"per second"* || "$qname_lower" = *"createcapacity"* ]] && compatible="no"
@@ -405,9 +371,6 @@ build_report_data() {
             fi
             [[ -z "$quota_per_10" ]] && quota_per_10="N/A"
 
-            if [[ "$est_daily" != "N/A" && "$est_daily" != "" && "$est_daily" != "?" ]]; then
-                [[ "$best_est_daily" = "N/A" ]] && best_est_daily="$est_daily"
-            fi
             # quota_per_10 from most expensive SKU (lowest value = tightest budget)
             if [[ "$quota_per_10" != "N/A" && "$quota_per_10" =~ ^[0-9]+$ ]]; then
                 if [[ "$best_quota_per_10" = "N/A" ]] || [[ "$quota_per_10" -lt "$best_quota_per_10" ]]; then
@@ -427,7 +390,7 @@ build_report_data() {
         fi
         [[ -z "$quota_name" ]] && quota_name="Quota"
         rows="${rows}
-${PROJECT_ID}|${api_service}|${quota_name}|${sku_combined}|${quota_val:-N/A}|${best_quota_per_10}|${best_est_daily:-N/A}|0|"
+${api_service}|${quota_name}|${sku_combined}|${quota_val:-N/A}|${best_quota_per_10}|"
     done
 
     # Save bulk quota cache for next run
@@ -435,6 +398,21 @@ ${PROJECT_ID}|${api_service}|${quota_name}|${sku_combined}|${quota_val:-N/A}|${b
 
     echo "REPORT_STATS|${report_services}|${report_skus}"
     echo "$rows"
+}
+
+# --- Sort rows by quota_per_10 asc (most expensive first), then quota desc ---
+sort_rows() {
+    local rows="$1"
+    local sorted
+    sorted=$(echo "$rows" | grep -v '^$' | while IFS='|' read -r svc qname sku quota qper10 _; do
+        local sortkey="999999"
+        [[ -n "$qper10" && "$qper10" != "N/A" && "$qper10" =~ ^[0-9]+$ && "$qper10" -gt 0 ]] && sortkey="$qper10"
+        local sortkey_quota="0"
+        [[ "$quota" = "unlimited" ]] && sortkey_quota="9223372036854775807"
+        [[ "$quota" =~ ^[0-9]+$ ]] && sortkey_quota="$quota"
+        printf '%s|%s|%s|%s|%s|%s|\n' "$sortkey" "$sortkey_quota" "$svc" "$qname" "$sku" "$quota" "$qper10"
+    done | sort -t'|' -k1 -n -k2 -rn 2>/dev/null | cut -d'|' -f3-)
+    echo "$sorted"
 }
 
 # --- Format and output ---
@@ -454,8 +432,18 @@ main() {
 
     log_info "Found ${#all_projects[@]} project(s): ${all_projects[*]}"
 
-    local all_rows=""
     local total_services=0 total_skus=0
+
+    # Start report file
+    {
+        echo "# GCP Quota & Billing Report"
+        echo ""
+        echo "**Projects:** ${all_projects[*]}"
+        echo "**Generated:** $(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
+        echo ""
+        echo "---"
+        echo ""
+    } > "$REPORT_FILE"
 
     for pid in "${all_projects[@]}"; do
         local raw_output
@@ -473,55 +461,45 @@ main() {
         fi
         total_services=$((total_services + stat_services))
         total_skus=$((total_skus + stat_skus))
-        all_rows="${all_rows}
-${data_rows}"
+
+        local sorted
+        sorted=$(sort_rows "$data_rows")
+
+        # Append per-project section to report file
+        {
+            echo "## $pid"
+            echo ""
+            echo "**Services** $stat_services, **SKUs** $stat_skus"
+            echo ""
+            echo "| Service | Quota name | SKU(s) | Current quota | Quota per \$10/day |"
+            echo "|---------|------------|--------|---------------|-------------------|"
+            echo "$sorted" | while IFS='|' read -r svc qname sku quota qper10 _; do
+                [[ -z "$svc" ]] && continue
+                printf '| %s | %s | %s | %s | %s |\n' "$svc" "$qname" "${sku}" "${quota:-N/A}" "${qper10:-N/A}"
+            done
+            echo ""
+        } >> "$REPORT_FILE"
+
+        # Print per-project table to terminal
+        echo ""
+        echo "=== $pid (sorted by Quota per \$10/day, cheapest first) ==="
+        echo ""
+        printf "%-38s %-22s %-42s %12s %16s\n" "Service" "Quota name" "SKU(s)" "Quota" "Per \$10/day"
+        echo "-------------------------------------------------------------------------------------------------------------------"
+        echo "$sorted" | while IFS='|' read -r svc qname sku quota qper10 _; do
+            [[ -z "$svc" ]] && continue
+            printf "%-38s %-22s %-42s %12s %16s\n" \
+                "${svc:0:36}" "${qname:0:20}" "${sku:0:40}" "${quota:-N/A}" "${qper10:-N/A}"
+        done
     done
 
-    # Sort all rows: by est price desc (primary), then by current quota desc (secondary)
-    local sorted
-    sorted=$(echo "$all_rows" | grep -v '^$' | while IFS='|' read -r proj svc qname sku quota qper10 est _ _; do
-        local sortkey_est="0"
-        [[ -n "$est" && "$est" != "N/A" && "$est" != "?" ]] && sortkey_est="$est"
-        if [[ "$sortkey_est" = "0" && -n "$qper10" && "$qper10" != "N/A" ]] && [[ "$qper10" =~ ^[0-9]+$ ]]; then
-            sortkey_est=$(echo "scale=2; 999999/$qper10" | bc 2>/dev/null || echo "0")
-        fi
-        local sortkey_quota="0"
-        [[ "$quota" = "unlimited" ]] && sortkey_quota="9223372036854775807"
-        [[ "$quota" =~ ^[0-9]+$ ]] && sortkey_quota="$quota"
-        printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$sortkey_est" "$sortkey_quota" "$proj" "$svc" "$qname" "$sku" "$quota" "$qper10" "$est" ""
-    done | sort -t'|' -k1 -rn -k2 -rn 2>/dev/null | cut -d'|' -f3-)
-    [[ -z "$sorted" ]] && sorted=$(echo "$all_rows" | grep -v '^$')
-
-    # Save full report to file
+    # Append summary footer to report
     {
-        echo "# GCP Quota & Billing Report"
-        echo ""
-        echo "**Projects:** ${all_projects[*]}"
-        echo "**Generated:** $(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
-        echo ""
         echo "---"
         echo ""
-        echo "**Services** $total_services, **SKUs** $total_skus"
-        echo ""
-        echo "| Project | Service | Quota name | SKU(s) | Current quota | Quota per \$10/day | Est. price daily |"
-        echo "|---------|---------|------------|--------|---------------|-------------------|------------------|"
-        echo "$sorted" | while IFS='|' read -r proj svc qname sku quota qper10 est _ _; do
-            [[ -z "$svc" ]] && continue
-            printf '| %s | %s | %s | %s | %s | %s | %s |\n' "$proj" "$svc" "$qname" "${sku}" "${quota:-N/A}" "${qper10:-N/A}" "${est:-N/A}"
-        done
-    } > "$REPORT_FILE"
+        echo "**Total services** $total_services, **Total SKUs** $total_skus"
+    } >> "$REPORT_FILE"
 
-    # Print table to terminal
-    echo ""
-    echo "=== Quota & Billing (sorted by Est. Price Daily, then Current quota) ==="
-    echo ""
-    printf "%-25s %-38s %-22s %-42s %12s %16s %16s\n" "Project" "Service" "Quota name" "SKU(s)" "Quota" "Per \$10/day" "Est.Daily"
-    echo "-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------"
-    echo "$sorted" | while IFS='|' read -r proj svc qname sku quota qper10 est _ _; do
-        [[ -z "$svc" ]] && continue
-        printf "%-25s %-38s %-22s %-42s %12s %16s %16s\n" \
-            "${proj:0:23}" "${svc:0:36}" "${qname:0:20}" "${sku:0:40}" "${quota:-N/A}" "${qper10:-N/A}" "${est:-N/A}"
-    done
     echo ""
     log_info "Full report: $REPORT_FILE"
 }
