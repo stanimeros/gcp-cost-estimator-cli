@@ -109,17 +109,28 @@ billing_get_skus() {
 
 # --- Get All Quotas: fetch per-service. Populates global quota_bulk_cache.
 # Skips services already present in the loaded cache (cache hit = no gcloud call).
+# Uses a temp file for all jq operations to avoid shell pipe size limits and corruption.
 # Usage: fetch_all_quotas PROJECT_ID SERVICE1 SERVICE2 ...
 fetch_all_quotas() {
     local project_id="$1"; shift
     local services=("$@")
-    local merged="${quota_bulk_cache:-{}}"
-    [[ -z "$merged" || "$merged" = "null" ]] && merged="{}"
+
+    # Write current cache to temp file for safe jq operations
+    local tmp_cache
+    tmp_cache=$(mktemp)
+    printf '%s' "${quota_bulk_cache:-{}}" > "$tmp_cache"
+
+    # Validate; reset to empty object if corrupt
+    if ! jq -e 'type == "object"' "$tmp_cache" &>/dev/null; then
+        printf '{}' > "$tmp_cache"
+    fi
+
+    local fetched=0
     for svc in "${services[@]}"; do
         [[ -z "$svc" ]] && continue
         # Skip if already cached for this service
         local existing
-        existing=$(echo "$merged" | jq -r --arg s "$svc" '.[$s] // empty' 2>/dev/null)
+        existing=$(jq -r --arg s "$svc" '.[$s] // empty' "$tmp_cache" 2>/dev/null)
         if [[ -n "$existing" && "$existing" != "null" && "$existing" != "[]" ]]; then
             continue
         fi
@@ -131,21 +142,31 @@ fetch_all_quotas() {
         fi
         # Only merge when gcloud returns a non-empty array
         if [[ -n "$data" ]] && echo "$data" | jq -e 'type == "array" and length > 0' &>/dev/null; then
-            local new_merged
-            new_merged=$(echo "$merged" | jq -c --arg s "$svc" --argjson d "$data" '.[$s] = $d' 2>/dev/null)
-            [[ -n "$new_merged" ]] && merged="$new_merged"
+            local tmp_new
+            tmp_new=$(mktemp)
+            jq -c --arg s "$svc" --argjson d "$data" '.[$s] = $d' "$tmp_cache" > "$tmp_new" 2>/dev/null
+            if jq -e 'type == "object"' "$tmp_new" &>/dev/null; then
+                mv "$tmp_new" "$tmp_cache"
+                fetched=$((fetched + 1))
+            else
+                rm -f "$tmp_new"
+            fi
         fi
     done
-    quota_bulk_cache="$merged"
+
+    quota_bulk_cache=$(cat "$tmp_cache")
+    rm -f "$tmp_cache"
 }
 
 # --- Get quota for service from bulk cache (lookup only - cache must be pre-populated) ---
 # Sets global quota_result (do NOT use in subshell - call directly)
 get_quota_for_service() {
     local service="$1"
-
-    # Lookup from pre-populated bulk cache
-    quota_result=$(echo "$quota_bulk_cache" | jq -r -c --arg s "$service" '.[$s] // []' 2>/dev/null)
+    local tmp_q
+    tmp_q=$(mktemp)
+    printf '%s' "$quota_bulk_cache" > "$tmp_q"
+    quota_result=$(jq -r -c --arg s "$service" '.[$s] // []' "$tmp_q" 2>/dev/null)
+    rm -f "$tmp_q"
     [[ -z "$quota_result" || "$quota_result" = "null" ]] && quota_result="[]"
 }
 
@@ -213,14 +234,14 @@ build_report_data() {
         services_to_process+=("$api_service")
     done
 
-    # Fetch all quotas up front
+    # Fetch all quotas up front — load from cache file directly (avoid shell var corruption)
     log_info "[$PROJECT_ID] Fetching all quotas..."
-    quota_bulk_cache=$(cache_get "quota_${PROJECT_ID}_all" 2>/dev/null)
-    if [[ -z "$quota_bulk_cache" || "$quota_bulk_cache" = "null" || "$quota_bulk_cache" = "" ]]; then
-        quota_bulk_cache=$(cat "${CACHE_DIR}/quota_${PROJECT_ID}_all.json" 2>/dev/null || true)
+    local quota_cache_file="${CACHE_DIR}/quota_${PROJECT_ID}_all.json"
+    if [[ -f "$quota_cache_file" ]] && jq -e 'type == "object"' "$quota_cache_file" &>/dev/null; then
+        quota_bulk_cache=$(cat "$quota_cache_file")
+    else
+        quota_bulk_cache="{}"
     fi
-    [[ -z "$quota_bulk_cache" || "$quota_bulk_cache" = "null" ]] && quota_bulk_cache="{}"
-    [[ "$quota_bulk_cache" = "" ]] && quota_bulk_cache="{}"
     fetch_all_quotas "$PROJECT_ID" "${services_to_process[@]}"
 
     for i in "${!enabled_services[@]}"; do
@@ -312,16 +333,28 @@ build_report_data() {
             sku_descs+=("$sku_desc")
 
             # Quota per $10/day: how many units $10 buys per day (based purely on SKU price+unit)
+            # usageUnit values seen in practice: h, GiBy, GiBy.mo, GiBy.h, GiBy.s, GiBy.d,
+            #   TiBy, MiBy, GBy.h, count, mo, min, s, ms, request, 1000, 1k
             local quota_per_10=""
             if [[ -n "$unit_price" && "$unit_price" != "0" ]]; then
-                case "$usage_unit" in
-                    *h|*Hour*)           quota_per_10=$(echo "scale=0; 10 / ($unit_price * 24)" | bc 2>/dev/null || echo "N/A") ;;
-                    *GiBy|*By|*GB*)      quota_per_10=$(echo "scale=0; 10 * 30 / $unit_price" | bc 2>/dev/null || echo "N/A") ;;
-                    *request*|*1000*|*1k*) quota_per_10=$(echo "scale=0; 10 * 1000 / $unit_price" | bc 2>/dev/null || echo "N/A") ;;
-                    *)                   quota_per_10=$(echo "scale=0; 10 / $unit_price" | bc 2>/dev/null || echo "N/A") ;;
+                local u="$usage_unit"
+                case "$u" in
+                    h|*Hour*)            quota_per_10=$(echo "scale=0; 10 / ($unit_price * 24)" | bc 2>/dev/null) ;;       # per hour → hours/day
+                    GiBy.mo|TiBy.mo|MiBy.mo|mo) quota_per_10=$(echo "scale=0; 10 / $unit_price" | bc 2>/dev/null) ;;      # per month
+                    GiBy.h|GBy.h)        quota_per_10=$(echo "scale=0; 10 / ($unit_price * 24)" | bc 2>/dev/null) ;;       # per GiBy-hour → GiBy that fit in $10/day
+                    GiBy.s|GBy.s)        quota_per_10=$(echo "scale=0; 10 / ($unit_price * 86400)" | bc 2>/dev/null) ;;    # per GiBy-second
+                    GiBy.d)              quota_per_10=$(echo "scale=0; 10 / $unit_price" | bc 2>/dev/null) ;;              # per GiBy-day
+                    GiBy|GBy)            quota_per_10=$(echo "scale=0; 10 * 30 / $unit_price" | bc 2>/dev/null) ;;         # per GiBy (storage, monthly)
+                    TiBy)                quota_per_10=$(echo "scale=0; 10 * 30 / $unit_price" | bc 2>/dev/null) ;;         # per TiBy
+                    MiBy)                quota_per_10=$(echo "scale=0; 10 * 30 * 1024 / $unit_price" | bc 2>/dev/null) ;;  # per MiBy → more units
+                    min)                 quota_per_10=$(echo "scale=0; 10 / ($unit_price * 1440)" | bc 2>/dev/null) ;;     # per minute → minutes/day
+                    s|ms)                quota_per_10=$(echo "scale=0; 10 / ($unit_price * 86400)" | bc 2>/dev/null) ;;    # per second
+                    count|1)             quota_per_10=$(echo "scale=0; 10 / $unit_price" | bc 2>/dev/null) ;;              # per item/count
+                    *request*|*1000*|*1k*) quota_per_10=$(echo "scale=0; 10 * 1000 / $unit_price" | bc 2>/dev/null) ;;    # per 1000 requests
+                    *)                   quota_per_10=$(echo "scale=0; 10 / $unit_price" | bc 2>/dev/null) ;;              # fallback
                 esac
             fi
-            [[ -z "$quota_per_10" ]] && quota_per_10="N/A"
+            [[ -z "$quota_per_10" || "$quota_per_10" = "0" ]] && quota_per_10="N/A"
 
             # quota_per_10 from most expensive SKU (lowest value = tightest budget)
             if [[ "$quota_per_10" != "N/A" && "$quota_per_10" =~ ^[0-9]+$ ]]; then
@@ -345,8 +378,19 @@ build_report_data() {
 ${api_service}|${quota_name}|${sku_combined}|${quota_val:-N/A}|${best_quota_per_10}|"
     done
 
-    # Save bulk quota cache for next run
-    [[ -n "$quota_bulk_cache" ]] && cache_set "quota_${PROJECT_ID}_all" "$quota_bulk_cache"
+    # Save bulk quota cache for next run — write via temp file to avoid corruption
+    if [[ -n "$quota_bulk_cache" && "$quota_bulk_cache" != "{}" ]]; then
+        local tmp_save
+        tmp_save=$(mktemp)
+        printf '%s' "$quota_bulk_cache" > "$tmp_save"
+        if jq -e 'type == "object"' "$tmp_save" &>/dev/null; then
+            mkdir -p "$CACHE_DIR"
+            mv "$tmp_save" "${CACHE_DIR}/quota_${PROJECT_ID}_all.json"
+        else
+            rm -f "$tmp_save"
+            log_warn "[$PROJECT_ID] Quota cache validation failed, not saving."
+        fi
+    fi
 
     echo "REPORT_STATS|${report_services}|${report_skus}"
     echo "$rows"
