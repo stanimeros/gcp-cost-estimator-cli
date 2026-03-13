@@ -46,6 +46,11 @@ check_prerequisites() {
         log_error "Not authenticated. Run: gcloud auth login"
         exit 1
     fi
+    # Ensure gcloud beta component is installed (required for quota list)
+    if ! gcloud components list --only-local-state --filter="id:beta" --format="value(id)" 2>/dev/null | grep -q "beta"; then
+        log_info "Installing gcloud beta component (output below)..."
+        gcloud components install beta --quiet 2>&1
+    fi
     if [[ -z "$PROJECT_ID" ]]; then
         local default_project
         default_project=$(gcloud config get-value project 2>/dev/null || true)
@@ -132,24 +137,25 @@ billing_get_skus() {
     echo "$result"
 }
 
-# --- Get All Quotas: bulk fetch only ---
-# Populates global quota_bulk_cache. Call before the main report loop.
+# --- Get All Quotas: fetch per-service (gcloud beta quotas info list --service= was removed) ---
+# Uses gcloud beta quotas info list --service=X per service. Populates global quota_bulk_cache.
+# Usage: fetch_all_quotas SERVICE1 SERVICE2 ...
 fetch_all_quotas() {
-    local all_quotas
-    if command -v timeout &>/dev/null; then
-        all_quotas=$(timeout 5 gcloud beta services quota list --project="$PROJECT_ID" --format="json" 2>/dev/null)
-    else
-        all_quotas=$(gcloud beta services quota list --project="$PROJECT_ID" --format="json" 2>/dev/null)
-    fi
-    if [[ -n "$all_quotas" ]] && echo "$all_quotas" | jq -e '.' &>/dev/null; then
-        # Parse bulk response: group consumerQuotaMetrics by service name
-        quota_bulk_cache=$(echo "$all_quotas" | jq -c '
-            if type == "array" then . else [.] end |
-            [.[] | .consumerQuotaMetrics? // . | if type == "array" then .[] else . end] |
-            flatten | group_by(.name | split("/") | .[3]) |
-            map({key: (.[0].name | split("/") | .[3]), value: .}) | from_entries
-        ' 2>/dev/null)
-    fi
+    local services=("$@")
+    local merged="{}"
+    for svc in "${services[@]}"; do
+        [[ -z "$svc" ]] && continue
+        local data
+        if command -v timeout &>/dev/null; then
+            data=$(timeout 30 gcloud beta quotas info list --service="$svc" --project="$PROJECT_ID" --format="json" 2>&1)
+        else
+            data=$(gcloud beta quotas info list --service="$svc" --project="$PROJECT_ID" --format="json" 2>&1)
+        fi
+        if [[ -n "$data" ]] && echo "$data" | jq -e 'type == "array"' &>/dev/null; then
+            merged=$(echo "$merged" | jq -c --arg s "$svc" --argjson d "$data" '.[$s] = $d' 2>/dev/null)
+        fi
+    done
+    quota_bulk_cache="$merged"
 }
 
 # --- Get quota for service from bulk cache (lookup only - cache must be pre-populated) ---
@@ -225,11 +231,11 @@ build_report_data() {
     done
 
     # Get All Quotas first, then match with services
-    log_info "Fetching all quotas..."
+    log_info "Fetching all quotas (gcloud output below)..."
     quota_bulk_cache=$(cache_get "quota_${PROJECT_ID}_all" 2>/dev/null)
     [[ -z "$quota_bulk_cache" || "$quota_bulk_cache" = "null" ]] && quota_bulk_cache="{}"
     [[ "$quota_bulk_cache" = "" ]] && quota_bulk_cache="{}"
-    fetch_all_quotas
+    fetch_all_quotas "${services_to_process[@]}"
 
     for i in "${!enabled_services[@]}"; do
         local api_service="${enabled_services[$i]}"
@@ -254,13 +260,16 @@ build_report_data() {
         get_quota_for_service "$api_service"
         local quota_json="${quota_result:-[]}"
 
-        # Get first/main quota value for this service
+        # Get first/main quota value: support both old (consumerQuotaLimits) and new (dimensionsInfos.details.value) QuotaInfo format
         local quota_val
         quota_val=$(echo "$quota_json" | jq -r '
-            [.. | .consumerQuotaLimits? | select(. != null) | .[] | .quotaBuckets[0].effectiveLimit // empty] |
-            map(select(. != null)) | if length > 0 then (.[0] | tostring) else "" end
+            [.. | (.consumerQuotaLimits? | select(. != null) | .[] | .quotaBuckets[0].effectiveLimit // empty),
+             (.. | .dimensionsInfos? | select(. != null) | .[] | .details.value? // empty)] |
+            map(select(. != null and . != "")) | if length > 0 then (.[0] | tostring) else "" end
         ' 2>/dev/null)
+        # GCP uses -1 or 9223372036854775807 (2^63-1) for unlimited quotas
         [[ "$quota_val" = "-1" ]] && quota_val="unlimited"
+        [[ "$quota_val" = "9223372036854775807" ]] && quota_val="unlimited"
 
         # Process top SKUs (limit to avoid huge output)
         local idx=0
