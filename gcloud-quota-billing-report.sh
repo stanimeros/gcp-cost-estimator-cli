@@ -107,31 +107,22 @@ billing_get_skus() {
     echo "$result"
 }
 
-# --- Get All Quotas: fetch per-service. Populates global quota_bulk_cache.
-# Skips services already present in the loaded cache (cache hit = no gcloud call).
-# Uses a temp file for all jq operations to avoid shell pipe size limits and corruption.
+# Global temp files reused across calls within a project (set by build_report_data)
+TMP_QUOTA_CACHE=""   # quota JSON object for current project
+TMP_BILLING=""       # billing services catalog
+
+# --- Get All Quotas: fetch per-service into TMP_QUOTA_CACHE file.
+# Skips services already present in the file (cache hit = no gcloud call).
 # Usage: fetch_all_quotas PROJECT_ID SERVICE1 SERVICE2 ...
 fetch_all_quotas() {
     local project_id="$1"; shift
     local services=("$@")
-
-    # Write current cache to temp file for safe jq operations
-    local tmp_cache
-    tmp_cache=$(mktemp)
-    printf '%s' "${quota_bulk_cache:-{}}" > "$tmp_cache"
-
-    # Validate; reset to empty object if corrupt
-    if ! jq -e 'type == "object"' "$tmp_cache" &>/dev/null; then
-        printf '{}' > "$tmp_cache"
-    fi
-
-    local fetched=0
+    local tmp_new
+    tmp_new=$(mktemp)
     for svc in "${services[@]}"; do
         [[ -z "$svc" ]] && continue
-        # Skip if already cached for this service
-        local existing
-        existing=$(jq -r --arg s "$svc" '.[$s] // empty' "$tmp_cache" 2>/dev/null)
-        if [[ -n "$existing" && "$existing" != "null" && "$existing" != "[]" ]]; then
+        # Skip if already in cache file
+        if jq -e --arg s "$svc" 'has($s)' "$TMP_QUOTA_CACHE" &>/dev/null; then
             continue
         fi
         local data
@@ -140,33 +131,18 @@ fetch_all_quotas() {
         else
             data=$(gcloud beta quotas info list --service="$svc" --project="$project_id" --format="json" 2>&1)
         fi
-        # Only merge when gcloud returns a non-empty array
         if [[ -n "$data" ]] && echo "$data" | jq -e 'type == "array" and length > 0' &>/dev/null; then
-            local tmp_new
-            tmp_new=$(mktemp)
-            jq -c --arg s "$svc" --argjson d "$data" '.[$s] = $d' "$tmp_cache" > "$tmp_new" 2>/dev/null
-            if jq -e 'type == "object"' "$tmp_new" &>/dev/null; then
-                mv "$tmp_new" "$tmp_cache"
-                fetched=$((fetched + 1))
-            else
-                rm -f "$tmp_new"
-            fi
+            jq -c --arg s "$svc" --argjson d "$data" '.[$s] = $d' "$TMP_QUOTA_CACHE" > "$tmp_new" 2>/dev/null \
+                && mv "$tmp_new" "$TMP_QUOTA_CACHE"
         fi
     done
-
-    quota_bulk_cache=$(cat "$tmp_cache")
-    rm -f "$tmp_cache"
+    rm -f "$tmp_new"
 }
 
-# --- Get quota for service from bulk cache (lookup only - cache must be pre-populated) ---
+# --- Get quota for service from TMP_QUOTA_CACHE file ---
 # Sets global quota_result (do NOT use in subshell - call directly)
 get_quota_for_service() {
-    local service="$1"
-    local tmp_q
-    tmp_q=$(mktemp)
-    printf '%s' "$quota_bulk_cache" > "$tmp_q"
-    quota_result=$(jq -r -c --arg s "$service" '.[$s] // []' "$tmp_q" 2>/dev/null)
-    rm -f "$tmp_q"
+    quota_result=$(jq -r -c --arg s "$1" '.[$s] // []' "$TMP_QUOTA_CACHE" 2>/dev/null)
     [[ -z "$quota_result" || "$quota_result" = "null" ]] && quota_result="[]"
 }
 
@@ -194,6 +170,13 @@ get_sku_usage_unit() {
 # Outputs: REPORT_STATS line followed by data rows
 build_report_data() {
     local PROJECT_ID="$1"
+
+    # Set up persistent temp files for this project (reused by all helper functions)
+    TMP_BILLING=$(mktemp)
+    TMP_QUOTA_CACHE=$(mktemp)
+    # Ensure cleanup on exit/error
+    trap 'rm -f "$TMP_BILLING" "$TMP_QUOTA_CACHE"' RETURN
+
     log_info "[$PROJECT_ID] Fetching enabled services..."
     local enabled_services=()
     local enabled_titles=()
@@ -204,11 +187,13 @@ build_report_data() {
     done < <(gcloud services list --enabled --project="$PROJECT_ID" --format="value(config.name,config.title)" 2>/dev/null)
 
     log_info "[$PROJECT_ID] Fetching billing catalog..."
-    local billing_services
-    billing_services=$(billing_get_services)
-    if ! echo "$billing_services" | jq -e '.services' &>/dev/null; then
+    local billing_services_raw
+    billing_services_raw=$(billing_get_services)
+    if echo "$billing_services_raw" | jq -e '.services' > "$TMP_BILLING" 2>/dev/null; then
+        : # TMP_BILLING now has the full catalog
+    else
         log_warn "[$PROJECT_ID] Failed to fetch billing catalog. Check gcloud auth and cloud-billing.readonly permission."
-        billing_services='{"services":[]}'
+        echo '{"services":[]}' > "$TMP_BILLING"
     fi
 
     local rows=""
@@ -222,27 +207,27 @@ build_report_data() {
         [[ -z "$api_service" ]] && continue
         local sid
         local d_stripped="${dn% API}"
-        sid=$(echo "$billing_services" | jq -r --arg d "$dn" --arg ds "$d_stripped" '
+        sid=$(jq -r --arg d "$dn" --arg ds "$d_stripped" '
             .services[] | select(
                 .displayName == $d or
                 .displayName == $ds or
                 (($ds == "Generative Language") and (.displayName == "Gemini API")) or
                 ((.displayName | ascii_downcase) | startswith(($ds | ascii_downcase)))
             ) | .serviceId
-        ' 2>/dev/null | head -1)
+        ' "$TMP_BILLING" 2>/dev/null | head -1)
         [[ -z "$sid" || "$sid" = "null" ]] && continue
         services_to_process+=("$api_service")
     done
 
-    # Fetch all quotas up front — load from cache file directly (avoid shell var corruption)
+    # Load quota cache from disk into TMP_QUOTA_CACHE file
     log_info "[$PROJECT_ID] Fetching all quotas..."
     local quota_cache_file="${CACHE_DIR}/quota_${PROJECT_ID}_all.json"
     if [[ -f "$quota_cache_file" ]] && jq -e 'type == "object"' "$quota_cache_file" &>/dev/null; then
-        quota_bulk_cache=$(cat "$quota_cache_file")
+        cp "$quota_cache_file" "$TMP_QUOTA_CACHE"
     else
-        quota_bulk_cache="{}"
+        echo '{}' > "$TMP_QUOTA_CACHE"
     fi
-    fetch_all_quotas "$PROJECT_ID" "${services_to_process[@]}"
+    fetch_all_quotas "$PROJECT_ID" "${services_to_process[@]+"${services_to_process[@]}"}"
 
     for i in "${!enabled_services[@]}"; do
         local api_service="${enabled_services[$i]}"
@@ -251,14 +236,14 @@ build_report_data() {
 
         local service_id
         local d_stripped_inner="${display_name% API}"
-        service_id=$(echo "$billing_services" | jq -r --arg d "$display_name" --arg ds "$d_stripped_inner" '
+        service_id=$(jq -r --arg d "$display_name" --arg ds "$d_stripped_inner" '
             .services[] | select(
                 .displayName == $d or
                 .displayName == $ds or
                 (($ds == "Generative Language") and (.displayName == "Gemini API")) or
                 ((.displayName | ascii_downcase) | startswith(($ds | ascii_downcase)))
             ) | .serviceId
-        ' 2>/dev/null | head -1)
+        ' "$TMP_BILLING" 2>/dev/null | head -1)
         [[ -z "$service_id" || "$service_id" = "null" ]] && continue
 
         log_info "  $display_name ($api_service)..."
@@ -378,18 +363,10 @@ build_report_data() {
 ${api_service}|${quota_name}|${sku_combined}|${quota_val:-N/A}|${best_quota_per_10}|"
     done
 
-    # Save bulk quota cache for next run — write via temp file to avoid corruption
-    if [[ -n "$quota_bulk_cache" && "$quota_bulk_cache" != "{}" ]]; then
-        local tmp_save
-        tmp_save=$(mktemp)
-        printf '%s' "$quota_bulk_cache" > "$tmp_save"
-        if jq -e 'type == "object"' "$tmp_save" &>/dev/null; then
-            mkdir -p "$CACHE_DIR"
-            mv "$tmp_save" "${CACHE_DIR}/quota_${PROJECT_ID}_all.json"
-        else
-            rm -f "$tmp_save"
-            log_warn "[$PROJECT_ID] Quota cache validation failed, not saving."
-        fi
+    # Save quota cache for next run — copy TMP_QUOTA_CACHE to disk if valid and non-empty
+    if jq -e 'type == "object" and length > 0' "$TMP_QUOTA_CACHE" &>/dev/null; then
+        mkdir -p "$CACHE_DIR"
+        cp "$TMP_QUOTA_CACHE" "${CACHE_DIR}/quota_${PROJECT_ID}_all.json"
     fi
 
     echo "REPORT_STATS|${report_services}|${report_skus}"
