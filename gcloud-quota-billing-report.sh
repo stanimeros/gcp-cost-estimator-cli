@@ -189,9 +189,8 @@ build_report_data() {
     log_info "[$PROJECT_ID] Fetching billing catalog..."
     local billing_services_raw
     billing_services_raw=$(billing_get_services)
-    if echo "$billing_services_raw" | jq -e '.services' > "$TMP_BILLING" 2>/dev/null; then
-        : # TMP_BILLING now has the full catalog
-    else
+    echo "$billing_services_raw" > "$TMP_BILLING"
+    if ! jq -e '.services' "$TMP_BILLING" &>/dev/null; then
         log_warn "[$PROJECT_ID] Failed to fetch billing catalog. Check gcloud auth and cloud-billing.readonly permission."
         echo '{"services":[]}' > "$TMP_BILLING"
     fi
@@ -250,9 +249,12 @@ build_report_data() {
 
         local skus_json
         skus_json=$(billing_get_skus "$service_id")
+        local tmp_skus
+        tmp_skus=$(mktemp)
+        printf '%s' "$skus_json" > "$tmp_skus"
         local sku_count
-        sku_count=$(echo "$skus_json" | jq '.skus | length' 2>/dev/null || echo "0")
-        [[ "${sku_count:-0}" -eq 0 ]] && continue
+        sku_count=$(jq '.skus | length' "$tmp_skus" 2>/dev/null || echo "0")
+        [[ "${sku_count:-0}" -eq 0 ]] && { rm -f "$tmp_skus"; continue; }
 
         quota_result="[]"
         get_quota_for_service "$api_service"
@@ -325,7 +327,7 @@ build_report_data() {
                 local u="$usage_unit"
                 case "$u" in
                     h|*Hour*)            quota_per_10=$(echo "scale=0; 10 / ($unit_price * 24)" | bc 2>/dev/null) ;;       # per hour → hours/day
-                    GiBy.mo|TiBy.mo|MiBy.mo|mo) quota_per_10=$(echo "scale=0; 10 / $unit_price" | bc 2>/dev/null) ;;      # per month
+                    GiBy.mo|TiBy.mo|MiBy.mo|mo) quota_per_10=$(echo "scale=0; 10 * 30 / $unit_price" | bc 2>/dev/null) ;;  # per month → $10/day = $300/mo
                     GiBy.h|GBy.h)        quota_per_10=$(echo "scale=0; 10 / ($unit_price * 24)" | bc 2>/dev/null) ;;       # per GiBy-hour → GiBy that fit in $10/day
                     GiBy.s|GBy.s)        quota_per_10=$(echo "scale=0; 10 / ($unit_price * 86400)" | bc 2>/dev/null) ;;    # per GiBy-second
                     GiBy.d)              quota_per_10=$(echo "scale=0; 10 / $unit_price" | bc 2>/dev/null) ;;              # per GiBy-day
@@ -339,17 +341,22 @@ build_report_data() {
                     *)                   quota_per_10=$(echo "scale=0; 10 / $unit_price" | bc 2>/dev/null) ;;              # fallback
                 esac
             fi
+            quota_per_10=$(echo "$quota_per_10" | tr -d ' \n\r')
             [[ -z "$quota_per_10" || "$quota_per_10" = "0" ]] && quota_per_10="N/A"
 
             # quota_per_10 from most expensive SKU (lowest value = tightest budget)
-            if [[ "$quota_per_10" != "N/A" && "$quota_per_10" =~ ^[0-9]+$ ]]; then
-                if [[ "$best_quota_per_10" = "N/A" ]] || [[ "$quota_per_10" -lt "$best_quota_per_10" ]]; then
-                    best_quota_per_10="$quota_per_10"
+            # Accept integers; strip decimals (bc can output 27272.000)
+            local q10_int
+            q10_int=$(echo "$quota_per_10" | sed 's/^\([0-9]*\).*/\1/' | tr -d '\n')
+            if [[ -n "$q10_int" && "$q10_int" =~ ^[0-9]+$ && "$q10_int" -gt 0 ]]; then
+                if [[ "$best_quota_per_10" = "N/A" ]] || [[ "$q10_int" -lt "$best_quota_per_10" ]]; then
+                    best_quota_per_10="$q10_int"
                 fi
             fi
             ((idx++)) || true
-        done < <(echo "$skus_json" | jq -c '.skus[]?' 2>/dev/null)
+        done < <(jq -c '.skus[]?' "$tmp_skus" 2>/dev/null)
 
+        rm -f "$tmp_skus"
         [[ ${#sku_descs[@]} -eq 0 ]] && continue
         report_services=$((report_services + 1))
         report_skus=$((report_skus + ${#sku_descs[@]}))
