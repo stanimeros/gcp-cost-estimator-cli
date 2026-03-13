@@ -186,6 +186,50 @@ get_sku_usage_unit() {
     echo "$1" | jq -r '.pricingInfo[0].pricingExpression.usageUnit // "unknown"' 2>/dev/null
 }
 
+# --- Check if Quota unit and SKU unit are compatible for cost estimation ---
+# Quota: Bytes/By/GiBy/MiBy + SKU: GiBy.mo/GiBy/By → Match
+# Quota: Requests/1 (count) + SKU: request/1000 → Match
+# Quota: Requests + SKU: Storage → No match (N/A)
+units_compatible() {
+    local quota_unit="$1"
+    local quota_name="$2"
+    local sku_usage_unit="$3"
+    local q_unit_lower sku_lower qname_lower
+    q_unit_lower=$(echo "${quota_unit:-}" | tr '[:upper:]' '[:lower:]')
+    sku_lower=$(echo "${sku_usage_unit:-}" | tr '[:upper:]' '[:lower:]')
+    qname_lower=$(echo "${quota_name:-}" | tr '[:upper:]' '[:lower:]')
+
+    # Quota is storage/data (bytes)
+    if [[ "$q_unit_lower" =~ ^(by|giby|miby|tiby|kiby|kb|mb|gb|tb)$ ]] || \
+       [[ "$q_unit_lower" = *"by"* && "$q_unit_lower" != *"request"* ]]; then
+        # SKU must be storage: GiBy, By, GiBy.mo, etc.
+        if [[ "$sku_lower" = *"giby"* || "$sku_lower" = *"by"* || "$sku_lower" = *"gb"* || "$sku_lower" = *"miby"* ]]; then
+            return 0  # Match
+        fi
+        return 1  # Quota=storage, SKU=other → No match
+    fi
+
+    # Quota is requests/count (metricUnit "1" or name has "request")
+    if [[ "$q_unit_lower" = "1" ]] || [[ "$qname_lower" = *"request"* ]] || [[ "$q_unit_lower" = *"request"* ]]; then
+        # SKU must be request-based
+        if [[ "$sku_lower" = *"request"* || "$sku_lower" = *"1000"* || "$sku_lower" = *"1k"* ]]; then
+            return 0  # Match
+        fi
+        return 1  # Quota=requests, SKU=storage etc → No match
+    fi
+
+    # Quota is time-based (e.g. slots per hour) - metricUnit "1" with slot-related name
+    if [[ "$q_unit_lower" = "1" ]] && [[ "$qname_lower" = *"slot"* ]]; then
+        if [[ "$sku_lower" = *"h"* || "$sku_lower" = *"hour"* ]]; then
+            return 0
+        fi
+        return 1
+    fi
+
+    # Unknown quota unit: be permissive (allow calculation) to avoid false N/As
+    return 0
+}
+
 # --- Parse quota value from quota JSON ---
 get_quota_value() {
     local quota_json="$1"
@@ -274,8 +318,8 @@ build_report_data() {
         get_quota_for_service "$api_service"
         local quota_json="${quota_result:-[]}"
 
-        # Get first/main quota value and name: support QuotaInfo format (dimensionsInfos.details.value, quotaDisplayName)
-        local quota_val quota_name
+        # Get first/main quota value, name, and unit: support QuotaInfo format (metricUnit for unit matching)
+        local quota_val quota_name quota_unit
         quota_val=$(echo "$quota_json" | jq -r '
             [.[]? | select(.dimensionsInfos[]?.details.value? != null and .dimensionsInfos[]?.details.value? != "") |
              .dimensionsInfos[0].details.value | tostring] | if length > 0 then .[0] else "" end
@@ -283,6 +327,10 @@ build_report_data() {
         quota_name=$(echo "$quota_json" | jq -r '
             [.[]? | select(.dimensionsInfos[]?.details.value? != null and .dimensionsInfos[]?.details.value? != "") |
              .quotaDisplayName // .metricDisplayName // .quotaId // "Quota"] | if length > 0 then .[0] else "" end
+        ' 2>/dev/null)
+        quota_unit=$(echo "$quota_json" | jq -r '
+            [.[]? | select(.dimensionsInfos[]?.details.value? != null and .dimensionsInfos[]?.details.value? != "") |
+             .metricUnit // ""] | if length > 0 then .[0] else "" end
         ' 2>/dev/null)
         # GCP uses -1 or 9223372036854775807 (2^63-1) for unlimited quotas
         [[ "$quota_val" = "-1" ]] && quota_val="unlimited"
@@ -325,6 +373,10 @@ build_report_data() {
                 est_daily="unlimited"
             fi
 
+            # Unit match: Quota (By/GiBy) + SKU (GiBy.mo) = Match. Quota (Requests) + SKU (Storage) = N/A
+            if [[ "$do_calc" = "yes" ]] && ! units_compatible "${quota_unit:-}" "${quota_name:-}" "$usage_unit"; then
+                est_daily="N/A"
+            fi
             # Rate-limit quotas (e.g. "Requests for X", "per minute") or quota/SKU mismatch → N/A
             local qname_lower
             qname_lower=$(echo "${quota_name:-}" | tr '[:upper:]' '[:lower:]')
@@ -407,8 +459,8 @@ main() {
 
     # Format budget for summary (1 decimal)
     local budget_daily_fmt budget_per_fmt
-    budget_daily_fmt=$(echo "scale=1; $stat_budget_daily" | bc 2>/dev/null || echo "$stat_budget_daily")
-    budget_per_fmt=$(echo "scale=1; $stat_budget_per_service" | bc 2>/dev/null || echo "$stat_budget_per_service")
+    budget_daily_fmt=$(echo "scale=1; $stat_budget_daily/1" | bc 2>/dev/null || echo "$stat_budget_daily")
+    budget_per_fmt=$(echo "scale=1; $stat_budget_per_service/1" | bc 2>/dev/null || echo "$stat_budget_per_service")
 
     # Sort: unlimited est price first, then by est price desc (bigger first). Cols: service|quota_name|sku|quota|suggested|est|_
     local sorted
@@ -436,7 +488,7 @@ $sorted"
         echo ""
         echo "---"
         echo ""
-        echo "**Services** $stat_services, **SKUs** $stat_skus, **Daily budget** ${budget_daily_fmt}, **Per service daily budget** ${budget_per_fmt}"
+        echo "**Services** $stat_services, **SKUs** $stat_skus, **Daily budget** \$${budget_daily_fmt}, **Per service daily budget** \$${budget_per_fmt}"
         echo ""
         echo "| Service | Quota name | SKU(s) | Current quota | Suggested quota | Est. price daily |"
         echo "|---------|------------|--------|---------------|-----------------|------------------|"
