@@ -1,6 +1,6 @@
 # GCP Quota & Billing Report
 
-Shell script that uses Google Cloud CLI and Cloud Billing API to create a report with **enabled billable services**, quotas, SKUs, estimated daily cost, and suggested quota limits within a monthly budget.
+Shell script that uses Google Cloud CLI and Cloud Billing API to create a report with **enabled billable services** across all accessible GCP projects, showing quotas, SKUs, estimated daily cost, and how many quota units $10/day buys.
 
 ## Requirements
 
@@ -12,17 +12,10 @@ Shell script that uses Google Cloud CLI and Cloud Billing API to create a report
 ## Usage
 
 ```bash
-./gcloud-quota-billing-report.sh [TARGET_BUDGET_USD] [PROJECT_ID]
+./gcloud-quota-billing-report.sh
 ```
 
-Examples:
-
-```bash
-./gcloud-quota-billing-report.sh 500
-# Prompts for project ID if not provided
-
-./gcloud-quota-billing-report.sh 1000 my-project-id
-```
+The script automatically processes **all accessible GCP projects** (from `gcloud projects list`).
 
 ## Output
 
@@ -32,25 +25,25 @@ Examples:
 ## Report Summary
 
 The report header shows:
-- **Services** – number of enabled billable services
-- **SKUs** – total SKU count across services
-- **Daily budget** – monthly budget ÷ 30
-- **Per service daily budget** – daily budget ÷ number of services
+- **Projects** – list of processed project IDs
+- **Services** – total number of enabled billable services across all projects
+- **SKUs** – total SKU count across all services
 
 ## Columns
 
 | Column | Description |
 |--------|-------------|
-| Service | GCP API service name (e.g. `bigquery.googleapis.com`, `places-backend.googleapis.com`) for console matching |
+| Project | GCP project ID |
+| Service | GCP API service name (e.g. `bigquery.googleapis.com`) for console matching |
 | Quota name | Quota display name, including interval when available (e.g. per day, per minute) |
 | SKU(s) | Billing SKU descriptions for the service, truncated with ellipsis (…) after 80 chars |
 | Current quota | Current quota value (or `unlimited` when applicable) |
-| Suggested quota | Max units/day to stay within this service's budget share |
+| Quota per $10/day | How many quota units $10/day buys (from most expensive SKU), or **N/A** when not estimable |
 | Est. price daily | Estimated daily cost at full quota usage, or **N/A** when not estimable |
 
-## When Est. Price Daily is N/A
+## When Quota per $10/day and Est. Price Daily are N/A
 
-The estimate is shown as **N/A** when:
+The values are shown as **N/A** when:
 
 - **Unlimited quota** – no numeric limit to base calculation on
 - **Unit mismatch** – Quota unit (e.g. Requests) does not match SKU unit (e.g. Storage GiB)
