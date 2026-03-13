@@ -42,7 +42,7 @@ The report header shows:
 | Column | Description |
 |--------|-------------|
 | Service | GCP API service name (e.g. `bigquery.googleapis.com`, `places-backend.googleapis.com`) for console matching |
-| Quota name | Quota display name, including interval when available (per day, per minute, per second) |
+| Quota name | Quota display name, including interval when available (e.g. per day, per minute) |
 | SKU(s) | Billing SKU descriptions for the service, truncated with ellipsis (…) after 80 chars |
 | Current quota | Current quota value (or `unlimited` when applicable) |
 | Suggested quota | Max units/day to stay within this service's budget share |

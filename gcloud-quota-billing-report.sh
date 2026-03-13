@@ -336,13 +336,13 @@ build_report_data() {
             [.[]? | select(.dimensionsInfos[]?.details.value? != null and .dimensionsInfos[]?.details.value? != "") |
              .refreshInterval // ""] | if length > 0 then .[0] else "" end
         ' 2>/dev/null)
-        # Append " (per minute/day/second)" to quota name when refreshInterval is present
+        # Append " per minute/day/second" to quota name when refreshInterval is present
         if [[ -n "$refresh_interval" ]]; then
             case "$refresh_interval" in
-                minute) quota_name="${quota_name} (per minute)" ;;
-                day) quota_name="${quota_name} (per day)" ;;
-                second) quota_name="${quota_name} (per second)" ;;
-                *) quota_name="${quota_name} (per ${refresh_interval})" ;;
+                minute) quota_name="${quota_name} per minute" ;;
+                day) quota_name="${quota_name} per day" ;;
+                second) quota_name="${quota_name} per second" ;;
+                *) quota_name="${quota_name} per ${refresh_interval}" ;;
             esac
         fi
         # GCP uses -1 or 9223372036854775807 (2^63-1) for unlimited quotas
