@@ -477,15 +477,17 @@ main() {
     budget_daily_fmt=$(echo "scale=1; $stat_budget_daily/1" | bc 2>/dev/null || echo "$stat_budget_daily")
     budget_per_fmt=$(echo "scale=1; $stat_budget_per_service/1" | bc 2>/dev/null || echo "$stat_budget_per_service")
 
-    # Sort: unlimited est price first, then by est price desc (bigger first). Cols: service|quota_name|sku|quota|suggested|est|_
+    # Sort: by est price desc (primary), then by current quota desc (secondary)
     local sorted
     sorted=$(echo "$data_rows" | grep -v '^$' | while IFS='|' read -r svc qname sku quota sugg est _ _; do
-        local sortkey="0"
-        [[ "$est" = "unlimited" ]] && sortkey="999999999"
-        [[ "$sortkey" = "0" && -n "$est" && "$est" != "N/A" && "$est" != "?" ]] && sortkey="$est"
-        [[ "$sortkey" = "0" && -n "$sugg" && "$sugg" != "-" ]] && [[ "$sugg" =~ ^[0-9]+$ ]] && sortkey=$(echo "scale=2; 999999/$sugg" | bc 2>/dev/null || echo "0")
-        printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$sortkey" "$svc" "$qname" "$sku" "$quota" "$sugg" "$est" "0" ""
-    done | sort -t'|' -k1 -rn 2>/dev/null | cut -d'|' -f2-)
+        local sortkey_est="0"
+        [[ "$sortkey_est" = "0" && -n "$est" && "$est" != "N/A" && "$est" != "?" ]] && sortkey_est="$est"
+        [[ "$sortkey_est" = "0" && -n "$sugg" && "$sugg" != "-" ]] && [[ "$sugg" =~ ^[0-9]+$ ]] && sortkey_est=$(echo "scale=2; 999999/$sugg" | bc 2>/dev/null || echo "0")
+        local sortkey_quota="0"
+        [[ "$quota" = "unlimited" ]] && sortkey_quota="9223372036854775807"
+        [[ "$quota" =~ ^[0-9]+$ ]] && sortkey_quota="$quota"
+        printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$sortkey_est" "$sortkey_quota" "$svc" "$qname" "$sku" "$quota" "$sugg" "$est" "0" ""
+    done | sort -t'|' -k1 -rn -k2 -rn 2>/dev/null | cut -d'|' -f3-)
     [[ -z "$sorted" ]] && sorted=$(echo "$data_rows" | grep -v '^$')
 
     # Build table header (no Project; Service = api name for console matching)
@@ -515,7 +517,7 @@ $sorted"
 
     # Print table to terminal (highlights)
     echo ""
-    echo "=== Quota & Billing (sorted by Est. Price Daily) ==="
+    echo "=== Quota & Billing (sorted by Est. Price Daily, then Current quota) ==="
     echo ""
     printf "%-40s %-25s %-45s %12s %12s %18s\n" "Service" "Quota name" "SKU(s)" "Quota" "Suggested" "Est.Daily"
     echo "---------------------------------------------------------------------------------------------------------------------------------------------------"
