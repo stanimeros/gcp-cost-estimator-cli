@@ -114,7 +114,7 @@ billing_get_services() {
     token=$(gcloud auth print-access-token 2>/dev/null)
     local result
     result=$(curl -sS --max-time 15 -H "Authorization: Bearer $token" \
-        "https://cloudbilling.googleapis.com/v1/services?pageSize=500" 2>/dev/null)
+        "https://cloudbilling.googleapis.com/v1/services?pageSize=5000" 2>/dev/null)
     [[ -n "$result" ]] && cache_set "billing_services" "$result"
     echo "$result"
 }
@@ -139,10 +139,13 @@ billing_get_skus() {
 
 # --- Get All Quotas: fetch per-service (gcloud beta quotas info list --service= was removed) ---
 # Uses gcloud beta quotas info list --service=X per service. Populates global quota_bulk_cache.
+# Preserves existing cached entries when gcloud fails for a service.
 # Usage: fetch_all_quotas SERVICE1 SERVICE2 ...
 fetch_all_quotas() {
     local services=("$@")
-    local merged="{}"
+    # Start with existing cache so we keep data when gcloud fails
+    local merged="${quota_bulk_cache:-{}}"
+    [[ -z "$merged" || "$merged" = "null" ]] && merged="{}"
     for svc in "${services[@]}"; do
         [[ -z "$svc" ]] && continue
         local data
@@ -151,8 +154,11 @@ fetch_all_quotas() {
         else
             data=$(gcloud beta quotas info list --service="$svc" --project="$PROJECT_ID" --format="json" 2>&1)
         fi
-        if [[ -n "$data" ]] && echo "$data" | jq -e 'type == "array"' &>/dev/null; then
-            merged=$(echo "$merged" | jq -c --arg s "$svc" --argjson d "$data" '.[$s] = $d' 2>/dev/null)
+        # Only merge when gcloud returns a non-empty array; preserve cached data when gcloud returns [] or fails
+        if [[ -n "$data" ]] && echo "$data" | jq -e 'type == "array" and length > 0' &>/dev/null; then
+            local new_merged
+            new_merged=$(echo "$merged" | jq -c --arg s "$svc" --argjson d "$data" '.[$s] = $d' 2>/dev/null)
+            [[ -n "$new_merged" ]] && merged="$new_merged"
         fi
     done
     quota_bulk_cache="$merged"
@@ -270,9 +276,15 @@ build_report_data() {
         local dn="${enabled_titles[$i]}"
         [[ -z "$api_service" ]] && continue
         local sid
-        # Match: exact displayName, or with " API" suffix stripped (e.g. "BigQuery API" -> "BigQuery")
-        sid=$(echo "$billing_services" | jq -r --arg d "$dn" '
-            .services[] | select(.displayName == $d or .displayName == ($d | sub(" API$"; ""))) | .serviceId
+        # Match: exact, or " API" stripped (e.g. "BigQuery API" -> "BigQuery"), or billing starts with stripped (e.g. "Vertex AI" matches "Vertex AI Generative AI")
+        local d_stripped="${dn% API}"
+        sid=$(echo "$billing_services" | jq -r --arg d "$dn" --arg ds "$d_stripped" '
+            .services[] | select(
+                .displayName == $d or
+                .displayName == $ds or
+                (($ds == "Generative Language") and (.displayName == "Gemini API")) or
+                ((.displayName | ascii_downcase) | startswith(($ds | ascii_downcase)))
+            ) | .serviceId
         ' 2>/dev/null | head -1)
         [[ -z "$sid" || "$sid" = "null" ]] && continue
         services_to_process+=("$api_service")
@@ -281,6 +293,10 @@ build_report_data() {
     # Get All Quotas first, then match with services
     log_info "Fetching all quotas (gcloud output below)..."
     quota_bulk_cache=$(cache_get "quota_${PROJECT_ID}_all" 2>/dev/null)
+    # Use stale quota cache if fresh unavailable (quotas change rarely, gcloud can fail)
+    if [[ -z "$quota_bulk_cache" || "$quota_bulk_cache" = "null" || "$quota_bulk_cache" = "" ]]; then
+        quota_bulk_cache=$(cat "${CACHE_DIR}/quota_${PROJECT_ID}_all.json" 2>/dev/null || true)
+    fi
     [[ -z "$quota_bulk_cache" || "$quota_bulk_cache" = "null" ]] && quota_bulk_cache="{}"
     [[ "$quota_bulk_cache" = "" ]] && quota_bulk_cache="{}"
     fetch_all_quotas "${services_to_process[@]}"
@@ -301,8 +317,14 @@ build_report_data() {
         [[ -z "$api_service" ]] && continue
 
         local service_id
-        service_id=$(echo "$billing_services" | jq -r --arg d "$display_name" '
-            .services[] | select(.displayName == $d or .displayName == ($d | sub(" API$"; ""))) | .serviceId
+        local d_stripped_inner="${display_name% API}"
+        service_id=$(echo "$billing_services" | jq -r --arg d "$display_name" --arg ds "$d_stripped_inner" '
+            .services[] | select(
+                .displayName == $d or
+                .displayName == $ds or
+                (($ds == "Generative Language") and (.displayName == "Gemini API")) or
+                ((.displayName | ascii_downcase) | startswith(($ds | ascii_downcase)))
+            ) | .serviceId
         ' 2>/dev/null | head -1)
         [[ -z "$service_id" || "$service_id" = "null" ]] && continue
 
@@ -318,30 +340,41 @@ build_report_data() {
         get_quota_for_service "$api_service"
         local quota_json="${quota_result:-[]}"
 
-        # Get first/main quota value, name, unit, and refreshInterval (per day/minute): support QuotaInfo format
+        # Get first quota with a value from dimensionsInfos; fallback to first quota's name when no value
+        # Output: val|name|unit|refresh (single jq pass for consistency)
+        # Use temp file for large quota JSON to avoid pipe/arg size limits
+        local quota_extract tmpq
+        tmpq=$(mktemp 2>/dev/null || echo "/tmp/q_$$_$RANDOM")
+        printf '%s' "$quota_json" > "$tmpq" 2>/dev/null
+        quota_extract=$(jq -r '
+            . as $input |
+            ([.[]? | . as $q |
+              ([.dimensionsInfos[]?.details.value? | select(. != null and . != "")] | .[0]) as $v |
+              if $v != null then
+                ($v | tostring) + "|" + ($q.quotaDisplayName // $q.metricDisplayName // $q.quotaId // "Quota") + "|" + ($q.metricUnit // "") + "|" + ($q.refreshInterval // "")
+              else empty end
+            ] | .[0]) as $first |
+            if ($first != null and $first != "") then $first
+            else ($input | .[0]? | "|" + (.quotaDisplayName // .metricDisplayName // .quotaId // "Quota") + "||" + (.refreshInterval // ""))
+            end
+        ' "$tmpq" 2>/dev/null)
+        rm -f "$tmpq"
         local quota_val quota_name quota_unit refresh_interval
-        quota_val=$(echo "$quota_json" | jq -r '
-            [.[]? | select(.dimensionsInfos[]?.details.value? != null and .dimensionsInfos[]?.details.value? != "") |
-             .dimensionsInfos[0].details.value | tostring] | if length > 0 then .[0] else "" end
-        ' 2>/dev/null)
-        quota_name=$(echo "$quota_json" | jq -r '
-            [.[]? | select(.dimensionsInfos[]?.details.value? != null and .dimensionsInfos[]?.details.value? != "") |
-             .quotaDisplayName // .metricDisplayName // .quotaId // "Quota"] | if length > 0 then .[0] else "" end
-        ' 2>/dev/null)
-        quota_unit=$(echo "$quota_json" | jq -r '
-            [.[]? | select(.dimensionsInfos[]?.details.value? != null and .dimensionsInfos[]?.details.value? != "") |
-             .metricUnit // ""] | if length > 0 then .[0] else "" end
-        ' 2>/dev/null)
-        refresh_interval=$(echo "$quota_json" | jq -r '
-            [.[]? | select(.dimensionsInfos[]?.details.value? != null and .dimensionsInfos[]?.details.value? != "") |
-             .refreshInterval // ""] | if length > 0 then .[0] else "" end
-        ' 2>/dev/null)
-        # Append " per minute/day/second" to quota name when refreshInterval is present
+        if [[ -n "$quota_extract" ]]; then
+            quota_val=$(echo "$quota_extract" | cut -d'|' -f1)
+            quota_name=$(echo "$quota_extract" | cut -d'|' -f2)
+            quota_unit=$(echo "$quota_extract" | cut -d'|' -f3)
+            refresh_interval=$(echo "$quota_extract" | cut -d'|' -f4)
+            # Fallback when we had no value (second branch): val is empty, name in field 2
+            [[ -z "$quota_val" && "$quota_extract" = "|"* ]] && quota_name=$(echo "$quota_extract" | cut -d'|' -f2)
+        fi
+        # Append " per minute/day/second" etc. to quota name when refreshInterval is present
         if [[ -n "$refresh_interval" ]]; then
             case "$refresh_interval" in
                 minute) quota_name="${quota_name} per minute" ;;
                 day) quota_name="${quota_name} per day" ;;
                 second) quota_name="${quota_name} per second" ;;
+                *"minute"*) quota_name="${quota_name} per ${refresh_interval}" ;;
                 *) quota_name="${quota_name} per ${refresh_interval}" ;;
             esac
         fi
