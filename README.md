@@ -1,12 +1,11 @@
 # GCP Quota & Billing Report
 
-Shell script that uses Google Cloud CLI and Cloud Billing API to create a report with **enabled billable services** across all accessible GCP projects, showing quotas, SKUs, and how many quota units $10/day buys.
+Shell script that uses Google Cloud CLI and Cloud Billing API to create a report with **enabled billable services** across all billing-enabled GCP projects, showing quotas, SKUs, and how many quota units $10/day buys.
 
 ## Requirements
 
 - **gcloud CLI** – authenticated with `cloud-billing.readonly` scope
 - **jq** – `brew install jq`
-- **Cloud Billing API** enabled in the project
 - **gcloud beta** – for quota data (`gcloud components install beta`)
 
 ## Usage
@@ -15,25 +14,35 @@ Shell script that uses Google Cloud CLI and Cloud Billing API to create a report
 ./gcloud-quota-billing-report.sh
 ```
 
-The script automatically processes **all accessible GCP projects** (from `gcloud projects list`).
+The script automatically:
+1. Lists all accessible GCP projects (`gcloud projects list`)
+2. Skips projects without billing enabled
+3. Processes each billing-enabled project and outputs one table per project
 
 ## Output
 
 - **Terminal**: One table per project, sorted by Quota per $10/day (most expensive first)
-- **File** (`billing-report.md`): One markdown table per project, plus a total summary footer (overwrites each run)
+- **File** (`billing-report.md`): One markdown section per project, plus a total summary footer (overwrites each run)
 
-## Report Summary
+## Report Structure
 
-The report header shows:
-- **Projects** – list of processed project IDs
-- **Services** – total number of enabled billable services across all projects
-- **SKUs** – total SKU count across all services
+```
+# GCP Quota & Billing Report
+**Projects:** <billing-enabled project IDs>
+
+## <project-id>
+**Services** N, **SKUs** N
+| Service | Quota name | SKU(s) | Current quota | Quota per $10/day |
+...
+
+---
+**Total services** N, **Total SKUs** N
+```
 
 ## Columns
 
 | Column | Description |
 |--------|-------------|
-| Project | GCP project ID |
 | Service | GCP API service name (e.g. `bigquery.googleapis.com`) for console matching |
 | Quota name | Quota display name, including interval when available (e.g. per day, per minute) |
 | SKU(s) | Billing SKU descriptions for the service, truncated with ellipsis (…) after 80 chars |
@@ -66,6 +75,8 @@ Billing catalog (services + SKUs) and quota data are cached for 24h in `.cache/`
 
 - `CACHE_TTL=0` – disable cache
 - `CACHE_DIR=/custom/path` – use a different folder
+
+On subsequent runs within 24h, all `curl` and `gcloud beta quotas` calls are skipped. Only `gcloud projects list`, `gcloud beta billing projects describe`, and `gcloud services list` are called live each run.
 
 ## Execution Cost
 

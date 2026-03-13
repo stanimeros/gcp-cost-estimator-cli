@@ -432,20 +432,40 @@ main() {
 
     log_info "Found ${#all_projects[@]} project(s): ${all_projects[*]}"
 
+    # Filter to billing-enabled projects up front
+    local billed_projects=()
+    for pid in "${all_projects[@]}"; do
+        local billing_enabled
+        billing_enabled=$(gcloud beta billing projects describe "$pid" --format="value(billingEnabled)" 2>/dev/null)
+        if [[ "$billing_enabled" = "True" ]]; then
+            billed_projects+=("$pid")
+        else
+            log_info "[$pid] Billing not enabled, skipping."
+        fi
+    done
+
+    if [[ ${#billed_projects[@]} -eq 0 ]]; then
+        log_error "No projects with billing enabled found."
+        exit 1
+    fi
+
+    log_info "Processing ${#billed_projects[@]} billing-enabled project(s): ${billed_projects[*]}"
+
     local total_services=0 total_skus=0
 
-    # Start report file
+    # Start report file (only lists billing-enabled projects)
     {
         echo "# GCP Quota & Billing Report"
         echo ""
-        echo "**Projects:** ${all_projects[*]}"
+        echo "**Projects:** ${billed_projects[*]}"
         echo "**Generated:** $(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
         echo ""
         echo "---"
         echo ""
     } > "$REPORT_FILE"
 
-    for pid in "${all_projects[@]}"; do
+    for pid in "${billed_projects[@]}"; do
+
         local raw_output
         raw_output=$(build_report_data "$pid")
 
