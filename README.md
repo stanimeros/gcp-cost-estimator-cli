@@ -1,50 +1,50 @@
 # GCP Quota & Billing Report
 
-Shell script που χρησιμοποιεί το Google Cloud CLI και το Cloud Billing API για να δημιουργεί πίνακα με project, service SKU, current quota, estimated price daily και suggested quota για να πληρούν το budget.
+Shell script that uses Google Cloud CLI and Cloud Billing API to create a table with project, service SKU, current quota, estimated price daily, and suggested quota to meet the budget.
 
-## Απαιτήσεις
+## Requirements
 
-- **gcloud CLI** – authenticated με `cloud-billing.readonly` scope
+- **gcloud CLI** – authenticated with `cloud-billing.readonly` scope
 - **jq** – `brew install jq`
-- **Cloud Billing API** enabled στο project
-- (Προαιρετικά) `gcloud components install beta` για quota data
+- **Cloud Billing API** enabled in the project
+- (Optional) `gcloud components install beta` for quota data
 
-## Χρήση
+## Usage
 
 ```bash
 ./gcloud-quota-billing-report.sh 500
 ./gcloud-quota-billing-report.sh 1000 my-project-id
 
-# Γρήγορο τρέξιμο χωρίς quota (SKIP_QUOTA=1)
+# Fast run without quota (SKIP_QUOTA=1)
 SKIP_QUOTA=1 ./gcloud-quota-billing-report.sh 500
 ```
 
-## Έξοδος
+## Output
 
-- **Terminal**: Πίνακας με Project, Service, SKU, Quota, Est. Price Daily, Suggested Quota (sorted by cost)
-- **File** (`billing-report.md`): Πλήρες report (overwrites κάθε φορά)
+- **Terminal**: Table with Project, Service, SKU, Quota, Est. Price Daily, Suggested Quota (sorted by cost)
+- **File** (`billing-report.md`): Full report (overwrites each time)
 
-## Στήλες
+## Columns
 
-| Στήλη | Περιγραφή |
-|-------|-----------|
+| Column | Description |
+|--------|-------------|
 | Project | GCP project ID |
-| Service | Όνομα service (π.χ. BigQuery, Cloud Run) |
+| Service | Service name (e.g. BigQuery, Cloud Run) |
 | SKU | Billing SKU description |
-| Current Quota | Τρέχον quota (N/A αν SKIP_QUOTA=1) |
-| Est. Price Daily | Εκτιμώμενο ημερήσιο κόστος ανά πλήρη χρήση quota |
-| Suggested Quota | Προτεινόμενο quota για να μείνεις εντός budget |
+| Current Quota | Current quota (N/A if SKIP_QUOTA=1) |
+| Est. Price Daily | Estimated daily cost at full quota usage |
+| Suggested Quota | Suggested quota to stay within budget |
 
 ## Cache
 
-Το billing catalog (services + SKUs) cache-άρεται για 24h στο `~/.cache/gcloud-quota-pricing/`:
-- `CACHE_TTL=0` για απενεργοποίηση
-- `CACHE_DIR=/custom/path` για άλλο φάκελο
+The billing catalog (services + SKUs) is cached for 24h in `.cache/` (in the script folder):
+- `CACHE_TTL=0` to disable
+- `CACHE_DIR=/custom/path` for a different folder
 
-## Request-based APIs (Maps, Vision, κλπ)
+## Request-based APIs (Maps, Vision, etc.)
 
-Περιλαμβάνονται APIs που χρεώνουν ανά 1000 requests (Maps, Vision, Speech, Translation). Το suggested quota δείχνει max requests/day εντός budget.
+APIs that charge per 1000 requests (Maps, Vision, Speech, Translation) are included. Suggested quota shows max requests/day within budget.
 
-## Κόστος εκτέλεσης
+## Execution Cost
 
-**Δωρεάν.** Το Cloud Billing API είναι δωρεάν για read operations (catalog, SKUs). Τα gcloud commands χρησιμοποιούν Service Usage API που επίσης δεν χρεώνει για metadata reads.
+**Free.** The Cloud Billing API is free for read operations (catalog, SKUs). gcloud commands use the Service Usage API which also does not charge for metadata reads.

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # GCP Quota & Billing Report
-# Πίνακας με project, service SKU, current quota, estimated price daily,
-# suggested quota για να πληρούν το budget.
+# Table with project, service SKU, current quota, estimated price daily,
+# suggested quota to meet the budget.
 #
 # Usage:
 #   ./gcloud-quota-billing-report.sh [TARGET_BUDGET_USD] [PROJECT_ID]
@@ -16,8 +16,9 @@ PROJECT_ID=$(echo "${2:-}" | tr -d '[:space:]')
 REPORT_FILE="billing-report.md"
 BUDGET_DAILY=0
 QUOTA_TIMEOUT=3
-# Cache: ~/.cache/gcloud-quota-pricing/ or ./.cache, TTL 24h. Set CACHE_TTL=0 to disable.
-CACHE_DIR="${CACHE_DIR:-$HOME/.cache/gcloud-quota-pricing}"
+# Cache: in script folder (.cache/), TTL 24h. Set CACHE_TTL=0 to disable.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CACHE_DIR="${CACHE_DIR:-${SCRIPT_DIR}/.cache}"
 CACHE_TTL="${CACHE_TTL:-86400}"
 
 # Map: API service name -> Billing API display name
@@ -60,20 +61,20 @@ log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 # --- Prerequisites ---
 check_prerequisites() {
     if ! command -v gcloud &>/dev/null; then
-        log_error "gcloud CLI δεν βρέθηκε."
+        log_error "gcloud CLI not found."
         exit 1
     fi
     if ! command -v jq &>/dev/null; then
-        log_error "jq δεν βρέθηκε. Εγκατάστησε: brew install jq"
+        log_error "jq not found. Install: brew install jq"
         exit 1
     fi
     if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null | grep -q .; then
-        log_error "Δεν είσαι authenticated. Τρέξε: gcloud auth login"
+        log_error "Not authenticated. Run: gcloud auth login"
         exit 1
     fi
     if [[ -z "$PROJECT_ID" ]]; then
         PROJECT_ID=$(gcloud config get-value project 2>/dev/null || true)
-        [[ -z "$PROJECT_ID" ]] && { log_error "Δεν βρέθηκε project."; exit 1; }
+        [[ -z "$PROJECT_ID" ]] && { log_error "Project not found."; exit 1; }
         log_info "Project: $PROJECT_ID"
     fi
     if [[ -z "$TARGET_BUDGET_USD" ]]; then
@@ -111,7 +112,7 @@ billing_get_services() {
     local cached
     cached=$(cache_get "billing_services")
     if [[ -n "$cached" ]]; then
-        log_info "Billing catalog: από cache (TTL ${CACHE_TTL}s)"
+        log_info "Billing catalog: from cache (TTL ${CACHE_TTL}s)"
         echo "$cached"
         return
     fi
@@ -186,17 +187,17 @@ get_quota_value() {
 
 # --- Main: build report data ---
 build_report_data() {
-    log_info "Λήψη enabled services..."
+    log_info "Fetching enabled services..."
     local enabled_services=()
     while IFS= read -r line; do
         [[ -n "$line" ]] && enabled_services+=("$line")
     done < <(gcloud services list --enabled --project="$PROJECT_ID" --format="value(config.name)" 2>/dev/null)
 
-    log_info "Λήψη billing catalog..."
+    log_info "Fetching billing catalog..."
     local billing_services
     billing_services=$(billing_get_services)
     if ! echo "$billing_services" | jq -e '.services' &>/dev/null; then
-        log_warn "Cloud Billing API: Ελέγξτε ότι το Cloud Billing API είναι enabled και έχετε cloud-billing.readonly."
+        log_warn "Cloud Billing API: Ensure Cloud Billing API is enabled and you have cloud-billing.readonly."
         billing_services='{"services":[]}'
     fi
 
