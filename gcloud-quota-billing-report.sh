@@ -116,10 +116,10 @@ TMP_BILLING=""       # billing services catalog
 # Usage: fetch_all_quotas PROJECT_ID SERVICE1 SERVICE2 ...
 fetch_all_quotas() {
     local project_id="$1"; shift
-    local services=("$@")
+    local services=("${@+"$@"}")
     local tmp_new
     tmp_new=$(mktemp)
-    for svc in "${services[@]}"; do
+    for svc in "${services[@]+"${services[@]}"}"; do
         [[ -z "$svc" ]] && continue
         # Skip if already in cache file
         if jq -e --arg s "$svc" 'has($s)' "$TMP_QUOTA_CACHE" &>/dev/null; then
