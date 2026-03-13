@@ -36,7 +36,7 @@ Shell script that uses Google Cloud CLI and Cloud Billing API to create a table 
 
 ## Cache
 
-The billing catalog (services + SKUs) is cached for 24h in `.cache/` (in the script folder):
+The billing catalog (services + SKUs) and quota data are cached for 24h in `.cache/` (in the script folder):
 - `CACHE_TTL=0` to disable
 - `CACHE_DIR=/custom/path` for a different folder
 

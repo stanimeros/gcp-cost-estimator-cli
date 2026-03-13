@@ -159,10 +159,12 @@ billing_get_skus() {
     echo "$result"
 }
 
-# --- Get quota for service (with timeout) ---
-get_quota_for_service() {
+# --- Fetch quota for a single service (used when building bulk cache) ---
+fetch_quota_for_service() {
     local service="$1"
-    local consumer="projects/$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>/dev/null)"
+    local project_num="$2"
+    local consumer="projects/${project_num}"
+
     if command -v timeout &>/dev/null; then
         timeout "$QUOTA_TIMEOUT" gcloud beta services quota list --service="$service" \
             --consumer="$consumer" --format="json" 2>/dev/null || echo "[]"
@@ -170,6 +172,57 @@ get_quota_for_service() {
         gcloud beta services quota list --service="$service" \
             --consumer="$consumer" --format="json" 2>/dev/null || echo "[]"
     fi
+}
+
+# --- Get All Quotas: fetch quotas for all services upfront, then match with services ---
+# Populates global quota_bulk_cache. Call before the main report loop.
+# Usage: fetch_all_quotas PROJECT_NUM SERVICE1 SERVICE2 ...
+fetch_all_quotas() {
+    local project_num="$1"
+    shift
+    local services_to_fetch=("$@")
+
+    # Try bulk fetch first (if API supports --project without --service)
+    local all_quotas
+    all_quotas=$(gcloud beta services quota list --project="$PROJECT_ID" --format="json" 2>/dev/null)
+
+    if [[ -n "$all_quotas" ]] && echo "$all_quotas" | jq -e '.' &>/dev/null; then
+        # Parse bulk response: group consumerQuotaMetrics by service name
+        # Metric names: projects/N/services/SERVICE/consumerQuotaMetrics/...
+        quota_bulk_cache=$(echo "$all_quotas" | jq -c '
+            if type == "array" then . else [.] end |
+            [.[] | .consumerQuotaMetrics? // . | if type == "array" then .[] else . end] |
+            flatten |
+            group_by(.name | split("/") | .[3]) |
+            map({key: (.[0].name | split("/") | .[3]), value: .}) |
+            from_entries
+        ' 2>/dev/null)
+        [[ -n "$quota_bulk_cache" && "$quota_bulk_cache" != "null" ]] && return
+    fi
+
+    # Fallback: fetch per-service for all services we will process
+    # Use existing cache, only fetch services we don't have
+    for svc in "${services_to_fetch[@]}"; do
+        [[ -z "$svc" ]] && continue
+        local cached
+        cached=$(echo "$quota_bulk_cache" | jq -r -c --arg s "$svc" '.[$s] // empty' 2>/dev/null)
+        if [[ -n "$cached" && "$cached" != "[]" && "$cached" != "null" ]]; then
+            continue
+        fi
+        local data
+        data=$(fetch_quota_for_service "$svc" "$project_num")
+        quota_bulk_cache=$(echo "$quota_bulk_cache" | jq -c --arg s "$svc" --argjson d "$data" '.[$s] = $d' 2>/dev/null)
+    done
+}
+
+# --- Get quota for service from bulk cache (lookup only - cache must be pre-populated) ---
+# Sets global quota_result (do NOT use in subshell - call directly)
+get_quota_for_service() {
+    local service="$1"
+
+    # Lookup from pre-populated bulk cache
+    quota_result=$(echo "$quota_bulk_cache" | jq -r -c --arg s "$service" '.[$s] // []' 2>/dev/null)
+    [[ -z "$quota_result" || "$quota_result" = "null" ]] && quota_result="[]"
 }
 
 # --- Extract unit price (USD) from SKU pricing ---
@@ -219,6 +272,26 @@ build_report_data() {
     local project_num
     project_num=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>/dev/null)
 
+    # Build list of services we will process (enabled + billable)
+    local services_to_process=()
+    for api_service in "${enabled_services[@]}"; do
+        [[ -z "$api_service" ]] && continue
+        local dn
+        dn=$(get_billing_display_name "$api_service")
+        [[ -z "$dn" ]] && continue
+        local sid
+        sid=$(echo "$billing_services" | jq -r --arg d "$dn" '.services[] | select(.displayName == $d) | .serviceId' 2>/dev/null | head -1)
+        [[ -z "$sid" || "$sid" = "null" ]] && continue
+        services_to_process+=("$api_service")
+    done
+
+    # Get All Quotas first, then match with services
+    log_info "Fetching all quotas..."
+    quota_bulk_cache=$(cache_get "quota_${PROJECT_ID}_all" 2>/dev/null)
+    [[ -z "$quota_bulk_cache" || "$quota_bulk_cache" = "null" ]] && quota_bulk_cache="{}"
+    [[ "$quota_bulk_cache" = "" ]] && quota_bulk_cache="{}"
+    fetch_all_quotas "$project_num" "${services_to_process[@]}"
+
     for api_service in "${enabled_services[@]}"; do
         [[ -z "$api_service" ]] && continue
 
@@ -240,8 +313,9 @@ build_report_data() {
         sku_count=$(echo "$skus_json" | jq '.skus | length' 2>/dev/null || echo "0")
         [[ "${sku_count:-0}" -eq 0 ]] && continue
 
-        local quota_json="[]"
-        quota_json=$(get_quota_for_service "$api_service" 2>/dev/null) || quota_json="[]"
+        quota_result="[]"
+        get_quota_for_service "$api_service"
+        local quota_json="${quota_result:-[]}"
 
         # Get first/main quota value for this service
         local quota_val
@@ -300,6 +374,9 @@ ${PROJECT_ID}|${display_name}|${sku_desc}|${quota_val:-N/A}|${est_daily:-N/A}|${
             ((idx++)) || true
         done < <(echo "$skus_json" | jq -c '.skus[]?' 2>/dev/null)
     done
+
+    # Save bulk quota cache for next run
+    [[ -n "$quota_bulk_cache" ]] && cache_set "quota_${PROJECT_ID}_all" "$quota_bulk_cache"
 
     echo "$rows"
 }
