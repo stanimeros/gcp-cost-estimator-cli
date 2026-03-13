@@ -4,9 +4,14 @@ Shell script that uses Google Cloud CLI and Cloud Billing API to create a report
 
 ## Requirements
 
-- **gcloud CLI** – authenticated with `cloud-billing.readonly` scope
-- **jq** – `brew install jq`
-- **gcloud beta** – for quota data (`gcloud components install beta`)
+- **gcloud CLI** – installed and authenticated (`gcloud auth login`)
+- **gcloud beta component** – for quota data; auto-installed by the script if missing (`gcloud components install beta`)
+- **jq** – for JSON parsing (`brew install jq`)
+- **curl** and **bc** – standard on macOS, used for billing API calls and arithmetic
+- **IAM permissions** on each project:
+  - `serviceusage.services.list` – to list enabled APIs
+  - `serviceusage.quotas.get` – to read quota values (`gcloud beta quotas`)
+  - `billing.resourceAssociations.list` – to check if billing is enabled (`cloud-billing.readonly` role)
 
 ## Usage
 
@@ -53,14 +58,13 @@ The script automatically:
 
 The value is shown as **N/A** when:
 
-- **Unlimited quota** – no numeric limit to base calculation on
 - **Unit mismatch** – Quota unit (e.g. Requests) does not match SKU unit (e.g. Storage GiB)
 - **Rate-limit quotas** – e.g. "Requests per minute" (cost model differs from consumption)
-- **Sanity cap** – calculated value > 100,000 (likely quota/SKU mismatch)
+- **No pricing data** – SKU has zero or missing price
 
 ## Unit Matching
 
-For a cost estimate, the Quota unit must match the SKU unit:
+For Quota per $10/day to be calculated, the Quota unit must match the SKU unit:
 
 | Quota unit | SKU unit | Result |
 |------------|----------|--------|

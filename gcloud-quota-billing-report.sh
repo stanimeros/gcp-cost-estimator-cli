@@ -12,7 +12,6 @@ set -euo pipefail
 
 # --- Configuration ---
 REPORT_FILE="billing-report.md"
-QUOTA_TIMEOUT=2
 # Cache: in script folder (.cache/), TTL 24h. Set CACHE_TTL=0 to disable.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CACHE_DIR="${CACHE_DIR:-${SCRIPT_DIR}/.cache}"
@@ -226,7 +225,7 @@ build_report_data() {
     local billing_services
     billing_services=$(billing_get_services)
     if ! echo "$billing_services" | jq -e '.services' &>/dev/null; then
-        log_warn "Cloud Billing API: Ensure Cloud Billing API is enabled and you have cloud-billing.readonly."
+        log_warn "[$PROJECT_ID] Failed to fetch billing catalog. Check gcloud auth and cloud-billing.readonly permission."
         billing_services='{"services":[]}'
     fi
 
@@ -502,7 +501,7 @@ main() {
 
         # Print per-project table to terminal
         echo ""
-        echo "=== $pid (sorted by Quota per \$10/day, cheapest first) ==="
+        echo "=== $pid (sorted by Quota per \$10/day, most expensive first) ==="
         echo ""
         printf "%-38s %-22s %-42s %12s %16s\n" "Service" "Quota name" "SKU(s)" "Quota" "Per \$10/day"
         echo "-------------------------------------------------------------------------------------------------------------------"
