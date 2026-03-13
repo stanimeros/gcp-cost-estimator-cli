@@ -16,7 +16,7 @@ TARGET_BUDGET_USD=$(echo "${1:-}" | tr -d '[:space:]')
 PROJECT_ID=$(echo "${2:-}" | tr -d '[:space:]')
 REPORT_FILE="billing-report.md"
 BUDGET_DAILY=0
-QUOTA_TIMEOUT=3
+QUOTA_TIMEOUT=2
 # Cache: in script folder (.cache/), TTL 24h. Set CACHE_TTL=0 to disable.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CACHE_DIR="${CACHE_DIR:-${SCRIPT_DIR}/.cache}"
@@ -135,7 +135,7 @@ billing_get_services() {
     local token
     token=$(gcloud auth print-access-token 2>/dev/null)
     local result
-    result=$(curl -sS -H "Authorization: Bearer $token" \
+    result=$(curl -sS --max-time 15 -H "Authorization: Bearer $token" \
         "https://cloudbilling.googleapis.com/v1/services?pageSize=500" 2>/dev/null)
     [[ -n "$result" ]] && cache_set "billing_services" "$result"
     echo "$result"
@@ -153,16 +153,14 @@ billing_get_skus() {
     local token
     token=$(gcloud auth print-access-token 2>/dev/null)
     local result
-    result=$(curl -sS -H "Authorization: Bearer $token" \
+    result=$(curl -sS --max-time 15 -H "Authorization: Bearer $token" \
         "https://cloudbilling.googleapis.com/v1/services/${service_id}/skus?pageSize=100" 2>/dev/null)
     [[ -n "$result" ]] && cache_set "billing_skus_${service_id}" "$result"
     echo "$result"
 }
 
 # --- Get quota for service (with timeout) ---
-# Set SKIP_QUOTA=1 to skip (faster, quota column will be N/A)
 get_quota_for_service() {
-    [[ "${SKIP_QUOTA:-0}" = "1" ]] && { echo "[]"; return; }
     local service="$1"
     local consumer="projects/$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>/dev/null)"
     if command -v timeout &>/dev/null; then

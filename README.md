@@ -16,9 +16,6 @@ Shell script that uses Google Cloud CLI and Cloud Billing API to create a table 
 # Prompts for project ID if not provided
 
 ./gcloud-quota-billing-report.sh 1000 my-project-id
-
-# Fast run without quota (SKIP_QUOTA=1)
-SKIP_QUOTA=1 ./gcloud-quota-billing-report.sh 500
 ```
 
 ## Output
@@ -33,7 +30,7 @@ SKIP_QUOTA=1 ./gcloud-quota-billing-report.sh 500
 | Project | GCP project ID |
 | Service | Service name (e.g. BigQuery, Cloud Run) |
 | SKU | Billing SKU description |
-| Current Quota | Current quota (N/A if SKIP_QUOTA=1) |
+| Current Quota | Current quota (or "unlimited" when applicable) |
 | Est. Price Daily | Estimated daily cost at full quota usage |
 | Suggested Quota | Suggested quota to stay within budget |
 
