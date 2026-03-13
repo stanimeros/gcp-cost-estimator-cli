@@ -108,23 +108,28 @@ billing_get_skus() {
 }
 
 # --- Get All Quotas: fetch per-service. Populates global quota_bulk_cache.
-# Preserves existing cached entries when gcloud fails for a service.
+# Skips services already present in the loaded cache (cache hit = no gcloud call).
 # Usage: fetch_all_quotas PROJECT_ID SERVICE1 SERVICE2 ...
 fetch_all_quotas() {
     local project_id="$1"; shift
     local services=("$@")
-    # Start with existing cache so we keep data when gcloud fails
     local merged="${quota_bulk_cache:-{}}"
     [[ -z "$merged" || "$merged" = "null" ]] && merged="{}"
     for svc in "${services[@]}"; do
         [[ -z "$svc" ]] && continue
+        # Skip if already cached for this service
+        local existing
+        existing=$(echo "$merged" | jq -r --arg s "$svc" '.[$s] // empty' 2>/dev/null)
+        if [[ -n "$existing" && "$existing" != "null" && "$existing" != "[]" ]]; then
+            continue
+        fi
         local data
         if command -v timeout &>/dev/null; then
             data=$(timeout 30 gcloud beta quotas info list --service="$svc" --project="$project_id" --format="json" 2>&1)
         else
             data=$(gcloud beta quotas info list --service="$svc" --project="$project_id" --format="json" 2>&1)
         fi
-        # Only merge when gcloud returns a non-empty array; preserve cached data when gcloud returns [] or fails
+        # Only merge when gcloud returns a non-empty array
         if [[ -n "$data" ]] && echo "$data" | jq -e 'type == "array" and length > 0' &>/dev/null; then
             local new_merged
             new_merged=$(echo "$merged" | jq -c --arg s "$svc" --argjson d "$data" '.[$s] = $d' 2>/dev/null)
@@ -160,50 +165,6 @@ get_sku_unit_price() {
 # --- Get usage unit from SKU ---
 get_sku_usage_unit() {
     echo "$1" | jq -r '.pricingInfo[0].pricingExpression.usageUnit // "unknown"' 2>/dev/null
-}
-
-# --- Check if Quota unit and SKU unit are compatible for cost estimation ---
-# Quota: Bytes/By/GiBy/MiBy + SKU: GiBy.mo/GiBy/By → Match
-# Quota: Requests/1 (count) + SKU: request/1000 → Match
-# Quota: Requests + SKU: Storage → No match (N/A)
-units_compatible() {
-    local quota_unit="$1"
-    local quota_name="$2"
-    local sku_usage_unit="$3"
-    local q_unit_lower sku_lower qname_lower
-    q_unit_lower=$(echo "${quota_unit:-}" | tr '[:upper:]' '[:lower:]')
-    sku_lower=$(echo "${sku_usage_unit:-}" | tr '[:upper:]' '[:lower:]')
-    qname_lower=$(echo "${quota_name:-}" | tr '[:upper:]' '[:lower:]')
-
-    # Quota is storage/data (bytes)
-    if [[ "$q_unit_lower" =~ ^(by|giby|miby|tiby|kiby|kb|mb|gb|tb)$ ]] || \
-       [[ "$q_unit_lower" = *"by"* && "$q_unit_lower" != *"request"* ]]; then
-        # SKU must be storage: GiBy, By, GiBy.mo, etc.
-        if [[ "$sku_lower" = *"giby"* || "$sku_lower" = *"by"* || "$sku_lower" = *"gb"* || "$sku_lower" = *"miby"* ]]; then
-            return 0  # Match
-        fi
-        return 1  # Quota=storage, SKU=other → No match
-    fi
-
-    # Quota is requests/count (metricUnit "1" or name has "request")
-    if [[ "$q_unit_lower" = "1" ]] || [[ "$qname_lower" = *"request"* ]] || [[ "$q_unit_lower" = *"request"* ]]; then
-        # SKU must be request-based
-        if [[ "$sku_lower" = *"request"* || "$sku_lower" = *"1000"* || "$sku_lower" = *"1k"* ]]; then
-            return 0  # Match
-        fi
-        return 1  # Quota=requests, SKU=storage etc → No match
-    fi
-
-    # Quota is time-based (e.g. slots per hour) - metricUnit "1" with slot-related name
-    if [[ "$q_unit_lower" = "1" ]] && [[ "$qname_lower" = *"slot"* ]]; then
-        if [[ "$sku_lower" = *"h"* || "$sku_lower" = *"hour"* ]]; then
-            return 0
-        fi
-        return 1
-    fi
-
-    # Unknown quota unit: be permissive (allow calculation) to avoid false N/As
-    return 0
 }
 
 
@@ -350,23 +311,15 @@ build_report_data() {
 
             sku_descs+=("$sku_desc")
 
-            local qname_lower
-            qname_lower=$(echo "${quota_name:-}" | tr '[:upper:]' '[:lower:]')
-
-            # Quota per $10/day: how many units $10 buys per day
+            # Quota per $10/day: how many units $10 buys per day (based purely on SKU price+unit)
             local quota_per_10=""
             if [[ -n "$unit_price" && "$unit_price" != "0" ]]; then
-                local compatible="yes"
-                ! units_compatible "${quota_unit:-}" "${quota_name:-}" "$usage_unit" && compatible="no"
-                [[ "$qname_lower" = *"request"* || "$qname_lower" = *"per minute"* || "$qname_lower" = *"per second"* || "$qname_lower" = *"createcapacity"* ]] && compatible="no"
-                if [[ "$compatible" = "yes" ]]; then
-                    case "$usage_unit" in
-                        *h|*Hour*) quota_per_10=$(echo "scale=0; 10 / ($unit_price * 24)" | bc 2>/dev/null || echo "N/A") ;;
-                        *GiBy|*By|*GB*) quota_per_10=$(echo "scale=0; 10 * 30 / $unit_price" | bc 2>/dev/null || echo "N/A") ;;
-                        *request*|*1000*|*1k*) quota_per_10=$(echo "scale=0; 10 * 1000 / $unit_price" | bc 2>/dev/null || echo "N/A") ;;
-                        *) quota_per_10=$(echo "scale=0; 10 / $unit_price" | bc 2>/dev/null || echo "N/A") ;;
-                    esac
-                fi
+                case "$usage_unit" in
+                    *h|*Hour*)           quota_per_10=$(echo "scale=0; 10 / ($unit_price * 24)" | bc 2>/dev/null || echo "N/A") ;;
+                    *GiBy|*By|*GB*)      quota_per_10=$(echo "scale=0; 10 * 30 / $unit_price" | bc 2>/dev/null || echo "N/A") ;;
+                    *request*|*1000*|*1k*) quota_per_10=$(echo "scale=0; 10 * 1000 / $unit_price" | bc 2>/dev/null || echo "N/A") ;;
+                    *)                   quota_per_10=$(echo "scale=0; 10 / $unit_price" | bc 2>/dev/null || echo "N/A") ;;
+                esac
             fi
             [[ -z "$quota_per_10" ]] && quota_per_10="N/A"
 

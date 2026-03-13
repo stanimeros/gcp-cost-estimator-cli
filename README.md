@@ -62,17 +62,6 @@ The value is shown as **N/A** when:
 - **Rate-limit quotas** – e.g. "Requests per minute" (cost model differs from consumption)
 - **No pricing data** – SKU has zero or missing price
 
-## Unit Matching
-
-For Quota per $10/day to be calculated, the Quota unit must match the SKU unit:
-
-| Quota unit | SKU unit | Result |
-|------------|----------|--------|
-| Bytes (By, GiBy, MiBy) | GiBy.mo, GiBy, By | ✅ Calculate |
-| Requests (metricUnit "1", name has "request") | request, 1000, 1k | ✅ Calculate |
-| Requests | Storage GiB | ❌ N/A |
-| Storage bytes | Requests | ❌ N/A |
-
 ## Cache
 
 Billing catalog (services + SKUs) and quota data are cached for 24h in `.cache/` (in the script folder):
