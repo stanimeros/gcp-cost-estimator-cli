@@ -442,6 +442,9 @@ is_safe_to_ignore() {
         monitoring.googleapis.com)    [[ "$qname" =~ [Aa]ctive[[:space:]]Alert ]] && return 0 ;;
         pubsub.googleapis.com)        [[ "$qname" =~ [Aa]cks ]] && [[ "$qname" =~ [Mm]odify ]] && return 0 ;;
         bigquery.googleapis.com)       [[ "$qname" =~ [Aa]lloyDB ]] && [[ "$qname" =~ [Ff]ederated ]] && return 0 ;;
+        bigquerystorage.googleapis.com) return 0 ;;
+        bigquerydatatransfer.googleapis.com) return 0 ;;
+        recaptchaenterprise.googleapis.com) return 0 ;;
     esac
     return 1
 }
@@ -631,6 +634,14 @@ main() {
         echo ""
         echo "- **pubsub.googleapis.com** (Acks and modify acks): 48GB/min is a high water mark. You pay for message throughput."
         echo "- **bigquery.googleapis.com** (AlloyDB federated query cross region): 1TB/day. Limit prevents network congestion; cost shows in BigQuery bill before quota."
+        echo ""
+        echo "### 4. High Throughput, Low Billing Risk"
+        echo ""
+        echo "Even with high throughput, these are almost never the source of a billing surprise."
+        echo ""
+        echo "- **bigquerystorage.googleapis.com**: Speed limit for moving data. You are billed for the data itself; this quota doesn't need monitoring."
+        echo "- **bigquerydatatransfer.googleapis.com**: API calls to set up a transfer. Almost always negligible."
+        echo "- **recaptchaenterprise.googleapis.com**: 1 million free assessments/month. Unlimited quota is standard; you'd need to be a massive target for it to cost you."
         echo ""
     } >> "$REPORT_FILE"
 
