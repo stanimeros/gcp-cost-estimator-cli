@@ -1,6 +1,6 @@
 # GCP Quota & Billing Report
 
-Shell script that uses Google Cloud CLI and Cloud Billing API to create a report with **enabled billable services** across all billing-enabled GCP projects, showing quotas, SKUs, and how many quota units $10/day buys.
+Shell script that uses Google Cloud CLI and Cloud Billing API to create a report with **enabled billable services** across all billing-enabled GCP projects, showing quotas, SKUs, and how many quota units your target daily budget buys.
 
 ## Requirements
 
@@ -16,8 +16,11 @@ Shell script that uses Google Cloud CLI and Cloud Billing API to create a report
 ## Usage
 
 ```bash
-./gcloud-quota-billing-report.sh
+./gcloud-quota-billing-report.sh [--full]
 ```
+
+- `--full` – Include "safe to ignore" services (default: hide them)
+- When run, the script prompts for a **target daily budget (USD)** (default: 10). Set `BUDGET_DAILY=50` to skip the prompt.
 
 The script automatically:
 1. Lists all accessible GCP projects (`gcloud projects list`)
@@ -26,8 +29,9 @@ The script automatically:
 
 ## Output
 
-- **Terminal**: One table per project, sorted by Quota per $10/day (most expensive first)
+- **Terminal**: One table per project, sorted by Quota per $/day (most expensive first)
 - **File** (`billing-report.md`): One markdown section per project, plus a total summary footer (overwrites each run)
+- **Filtered**: Rows where your budget buys more than the current quota are hidden (quota is not the bottleneck)
 
 ## Report Structure
 
@@ -36,12 +40,12 @@ The script automatically:
 **Projects:** <billing-enabled project IDs>
 
 ## <project-id>
-**Services** N, **SKUs** N
-| Service | Quota name | SKU(s) | Current quota | Quota per $10/day |
+**Quotas** N, **Services** N, **SKUs** N
+| Service | Quota name | SKU(s) | Current quota | Quota per $X/day |
 ...
 
 ---
-**Total services** N, **Total SKUs** N
+**Total quotas** N, **Total services** N, **Total SKUs** N
 ```
 
 ## Columns
@@ -52,9 +56,9 @@ The script automatically:
 | Quota name | Quota display name, including interval when available (e.g. per day, per minute) |
 | SKU(s) | Billing SKU descriptions for the service, truncated with ellipsis (…) after 80 chars |
 | Current quota | Current quota value (or `unlimited` when applicable) |
-| Quota per $10/day | How many quota units $10/day buys (from most expensive SKU), or **N/A** when not estimable |
+| Quota per $X/day | How many quota units your target budget buys (from most expensive SKU), or **N/A** when not estimable |
 
-## When Quota per $10/day is N/A
+## When Quota per $/day is N/A
 
 The value is shown as **N/A** when:
 
@@ -69,6 +73,7 @@ Billing catalog (services + SKUs) and quota data are cached in `.cache/` (in the
 To refetch: delete the cache folder (`rm -rf .cache/`).
 
 - `CACHE_DIR=/custom/path` – use a different cache folder
+- `BUDGET_DAILY=50` – target daily budget in USD (skips prompt)
 
 ## Execution Cost
 

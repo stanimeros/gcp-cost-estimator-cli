@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #
 # GCP Quota & Billing Report
-# Table with project, service SKU, current quota, and quota units per $10/day.
+# Table with project, service SKU, current quota, and quota units per target $/day.
 # Processes all accessible GCP projects.
 #
 # Usage:
-#   ./gcloud-quota-billing-report.sh
+#   ./gcloud-quota-billing-report.sh [--full]
+#   --full    Include "safe to ignore" services (default: hide them)
 #
 
 set -euo pipefail
@@ -15,6 +16,8 @@ REPORT_FILE="billing-report.md"
 # Cache: in script folder (.cache/). Delete .cache/ to refetch.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CACHE_DIR="${CACHE_DIR:-${SCRIPT_DIR}/.cache}"
+# Target daily budget (USD); set via prompt or BUDGET_DAILY env
+BUDGET_DAILY="${BUDGET_DAILY:-}"
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -295,35 +298,38 @@ build_report_data() {
 
             sku_descs+=("$sku_desc")
 
-            local quota_per_10=""
+            local budget="${BUDGET_DAILY:-10}"
+            local budget_mo
+            budget_mo=$(echo "$budget * 30" | bc -l 2>/dev/null)
+            local quota_per_budget=""
             if [[ -n "$unit_price" && "$unit_price" != "0" ]]; then
                 local raw_val=""
                 local u="$usage_unit"
                 case "$u" in
-                    h|*Hour*)            raw_val=$(echo "10 / ($unit_price * 24)" | bc -l 2>/dev/null) ;;
-                    GiBy.mo|TiBy.mo|MiBy.mo|mo) raw_val=$(echo "300 / $unit_price" | bc -l 2>/dev/null) ;;
-                    GiBy.h|GBy.h)        raw_val=$(echo "10 / ($unit_price * 24)" | bc -l 2>/dev/null) ;;
-                    GiBy.s|GBy.s)        raw_val=$(echo "10 / ($unit_price * 86400)" | bc -l 2>/dev/null) ;;
-                    GiBy.d)              raw_val=$(echo "10 / $unit_price" | bc -l 2>/dev/null) ;;
-                    GiBy|GBy)            raw_val=$(echo "300 / $unit_price" | bc -l 2>/dev/null) ;;
-                    TiBy)                raw_val=$(echo "300 / $unit_price" | bc -l 2>/dev/null) ;;
-                    MiBy)                raw_val=$(echo "300 * 1024 / $unit_price" | bc -l 2>/dev/null) ;;
-                    min)                 raw_val=$(echo "10 / ($unit_price * 1440)" | bc -l 2>/dev/null) ;;
-                    s|ms)                raw_val=$(echo "10 / ($unit_price * 86400)" | bc -l 2>/dev/null) ;;
-                    count|1)             raw_val=$(echo "10 / $unit_price" | bc -l 2>/dev/null) ;;
-                    *request*|*1000*|*1k*) raw_val=$(echo "10 * 1000 / $unit_price" | bc -l 2>/dev/null) ;;
-                    *)                   raw_val=$(echo "10 / $unit_price" | bc -l 2>/dev/null) ;;
+                    h|*Hour*)            raw_val=$(echo "$budget / ($unit_price * 24)" | bc -l 2>/dev/null) ;;
+                    GiBy.mo|TiBy.mo|MiBy.mo|mo) raw_val=$(echo "$budget_mo / $unit_price" | bc -l 2>/dev/null) ;;
+                    GiBy.h|GBy.h)        raw_val=$(echo "$budget / ($unit_price * 24)" | bc -l 2>/dev/null) ;;
+                    GiBy.s|GBy.s)        raw_val=$(echo "$budget / ($unit_price * 86400)" | bc -l 2>/dev/null) ;;
+                    GiBy.d)              raw_val=$(echo "$budget / $unit_price" | bc -l 2>/dev/null) ;;
+                    GiBy|GBy)            raw_val=$(echo "$budget_mo / $unit_price" | bc -l 2>/dev/null) ;;
+                    TiBy)                raw_val=$(echo "$budget_mo / $unit_price" | bc -l 2>/dev/null) ;;
+                    MiBy)                raw_val=$(echo "$budget_mo * 1024 / $unit_price" | bc -l 2>/dev/null) ;;
+                    min)                 raw_val=$(echo "$budget / ($unit_price * 1440)" | bc -l 2>/dev/null) ;;
+                    s|ms)                raw_val=$(echo "$budget / ($unit_price * 86400)" | bc -l 2>/dev/null) ;;
+                    count|1)             raw_val=$(echo "$budget / $unit_price" | bc -l 2>/dev/null) ;;
+                    *request*|*1000*|*1k*) raw_val=$(echo "$budget * 1000 / $unit_price" | bc -l 2>/dev/null) ;;
+                    *)                   raw_val=$(echo "$budget / $unit_price" | bc -l 2>/dev/null) ;;
                 esac
-                [[ -n "$raw_val" ]] && quota_per_10=$(printf "%.0f" "$raw_val" 2>/dev/null || echo "")
+                [[ -n "$raw_val" ]] && quota_per_budget=$(printf "%.0f" "$raw_val" 2>/dev/null || echo "")
             fi
-            quota_per_10=$(echo "$quota_per_10" | tr -d ' \n\r')
-            [[ -z "$quota_per_10" || "$quota_per_10" = "0" ]] && quota_per_10="N/A"
+            quota_per_budget=$(echo "$quota_per_budget" | tr -d ' \n\r')
+            [[ -z "$quota_per_budget" || "$quota_per_budget" = "0" ]] && quota_per_budget="N/A"
 
-            local q10_int
-            q10_int=$(echo "$quota_per_10" | sed 's/^\([0-9]*\).*/\1/' | tr -d '\n')
-            if [[ -n "$q10_int" && "$q10_int" =~ ^[0-9]+$ && "$q10_int" -gt 0 ]]; then
-                if [[ "$best_quota_per_10" = "N/A" ]] || [[ "$q10_int" -lt "$best_quota_per_10" ]]; then
-                    best_quota_per_10="$q10_int"
+            local q_int
+            q_int=$(echo "$quota_per_budget" | sed 's/^\([0-9]*\).*/\1/' | tr -d '\n')
+            if [[ -n "$q_int" && "$q_int" =~ ^[0-9]+$ && "$q_int" -gt 0 ]]; then
+                if [[ "$best_quota_per_10" = "N/A" ]] || [[ "$q_int" -lt "$best_quota_per_10" ]]; then
+                    best_quota_per_10="$q_int"
                 fi
             fi
             ((idx++)) || true
@@ -355,9 +361,15 @@ build_report_data() {
                 qname_lower=$(echo "$quota_name" | tr '[:upper:]' '[:lower:]')
                 [[ -n "$suffix" && "$qname_lower" != *"$suffix"* ]] && quota_name="${quota_name} ${suffix}"
             fi
+            [[ "$quota_val" = "null" || "$quota_val" = "Null" ]] && quota_val="0"
             [[ "$quota_val" = "-1" ]] && quota_val="unlimited"
             [[ "$quota_val" = "9223372036854775807" ]] && quota_val="unlimited"
             is_non_adjustable "$api_service" "$quota_name" "$is_fixed" && continue
+            # Hide when quota_per_budget > current_quota (budget buys more than quota allows; quota is not the bottleneck)
+            if [[ -n "$best_quota_per_10" && "$best_quota_per_10" != "N/A" && "$best_quota_per_10" =~ ^[0-9]+$ ]] && \
+               [[ "$quota_val" != "unlimited" && -n "$quota_val" && "$quota_val" =~ ^[0-9]+$ ]]; then
+                [[ "$best_quota_per_10" -gt "$quota_val" ]] && continue
+            fi
             report_services=$((report_services + 1))
             rows_added=$((rows_added + 1))
             rows="${rows}
@@ -484,12 +496,35 @@ sort_rows() {
         printf '%s|%s|%s|%s|%s|%s|%s\n' "$sortkey" "$sortkey_quota" "$svc" "$qname" "$sku" "$quota" "$qper10"
     done | sort -t'|' -k1 -n -k2 -rn 2>/dev/null | cut -d'|' -f3-)
 
-    { echo "$sort_need"; echo "$sort_safe"; } | grep -v '^$'
+    if [[ "${SHOW_SAFE_TO_IGNORE:-0}" = "1" ]]; then
+        { echo "$sort_need"; echo "$sort_safe"; } | grep -v '^$'
+    else
+        echo "$sort_need" | grep -v '^$'
+    fi
 }
 
 # --- Format and output ---
 main() {
+    SHOW_SAFE_TO_IGNORE=0
+    for arg in "$@"; do
+        [[ "$arg" = "--full" ]] && SHOW_SAFE_TO_IGNORE=1
+    done
+    [[ "$SHOW_SAFE_TO_IGNORE" = "1" ]] && log_info "Including safe-to-ignore services (--full)"
+
     check_prerequisites
+
+    # Ask for target daily budget
+    if [[ -z "${BUDGET_DAILY}" ]]; then
+        if [[ -t 0 ]]; then
+            read -r -p "Target daily budget (USD) [10]: " BUDGET_DAILY
+        fi
+        BUDGET_DAILY="${BUDGET_DAILY:-10}"
+    fi
+    if ! [[ "$BUDGET_DAILY" =~ ^[0-9]+\.?[0-9]*$ ]] || [[ "$(echo "$BUDGET_DAILY > 0" | bc -l 2>/dev/null)" -eq 0 ]]; then
+        log_error "Invalid budget. Use a positive number (e.g. 10 or 50)."
+        exit 1
+    fi
+    log_info "Target: \$${BUDGET_DAILY}/day"
 
     # Collect all accessible project IDs
     local all_projects=()
@@ -523,13 +558,13 @@ main() {
 
     log_info "Processing ${#billed_projects[@]} billing-enabled project(s): ${billed_projects[*]}"
 
-    local total_services=0 total_skus=0
+    local total_quotas=0 total_services=0 total_skus=0
 
     # Start report file (only lists billing-enabled projects)
     {
         echo "# GCP Quota & Billing Report"
         echo ""
-        echo "**Projects:** ${billed_projects[*]}"
+        echo "**Target:** \$${BUDGET_DAILY}/day | **Projects:** ${billed_projects[*]}"
         echo "**Generated:** $(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
         echo ""
         echo "---"
@@ -551,19 +586,24 @@ main() {
             stat_skus=0
             data_rows="$raw_output"
         fi
-        total_services=$((total_services + stat_services))
         total_skus=$((total_skus + stat_skus))
 
         local sorted
         sorted=$(sort_rows "$data_rows")
+        local stat_quotas
+        stat_quotas=$(echo "$sorted" | grep -c . 2>/dev/null || echo 0)
+        local stat_services
+        stat_services=$(echo "$sorted" | cut -d'|' -f1 | sort -u | grep -c . 2>/dev/null || echo 0)
+        total_quotas=$((total_quotas + stat_quotas))
+        total_services=$((total_services + stat_services))
 
         # Append per-project section to report file
         {
             echo "## $pid"
             echo ""
-            echo "**Services** $stat_services, **SKUs** $stat_skus"
+            echo "**Quotas** $stat_quotas, **Services** $stat_services, **SKUs** $stat_skus"
             echo ""
-            echo "| Service | Quota name | SKU(s) | Current quota | Quota per \$10/day |"
+            echo "| Service | Quota name | SKU(s) | Current quota | Quota per \$${BUDGET_DAILY}/day |"
             echo "|---------|------------|--------|---------------|-------------------|"
             echo "$sorted" | while IFS='|' read -r svc qname sku quota qper10 _; do
                 [[ -z "$svc" ]] && continue
@@ -588,7 +628,7 @@ main() {
         echo ""
         echo "=== $pid (need attention first, safe to ignore last) ==="
         echo ""
-        printf "%-38s %-22s %-42s %12s %16s\n" "Service" "Quota name" "SKU(s)" "Quota" "Per \$10/day"
+        printf "%-38s %-22s %-42s %12s %16s\n" "Service" "Quota name" "SKU(s)" "Quota" "Per \$${BUDGET_DAILY}/day"
         echo "-------------------------------------------------------------------------------------------------------------------"
         echo "$sorted" | while IFS='|' read -r svc qname sku quota qper10 _; do
             [[ -z "$svc" ]] && continue
@@ -601,7 +641,7 @@ main() {
     {
         echo "---"
         echo ""
-        echo "**Total services** $total_services, **Total SKUs** $total_skus"
+        echo "**Total quotas** $total_quotas, **Total services** $total_services, **Total SKUs** $total_skus"
     } >> "$REPORT_FILE"
 
     echo ""
