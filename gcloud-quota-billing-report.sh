@@ -408,19 +408,82 @@ truncate_cell() {
     echo "${s:0:$((max - 3))}..."
 }
 
-# --- Sort rows by quota_per_10 asc (most expensive first), then quota desc ---
+# --- Format SKU for multi-line (wrap to ~half width via <br>) ---
+format_sku_cell() {
+    local sku="$1"
+    local max_per_line=38
+    local max_lines=3
+    local result=""
+    local count=0
+    while IFS= read -r part; do
+        [[ $count -ge $max_lines ]] && { result="${result}<br>..."; break; }
+        part="${part#"${part%%[![:space:]]*}"}"
+        part="${part%"${part##*[![:space:]]}"}"
+        [[ -z "$part" ]] && continue
+        [[ ${#part} -gt $max_per_line ]] && part="${part:0:$((max_per_line - 3))}..."
+        [[ -n "$result" ]] && result="${result}<br>"
+        result="${result}${part}"
+        ((count++)) || true
+    done < <(echo "$sku" | tr ',' '\n')
+    echo "${result:-$sku}"
+}
+
+# --- Check if row is "safe to ignore" (management plane, plumbing, high-limit safety) ---
+is_safe_to_ignore() {
+    local svc="$1"
+    local qname="$2"
+    case "$svc" in
+        cloudtrace.googleapis.com)     [[ "$qname" =~ [Cc]onfiguration ]] && return 0 ;;
+        eventarc.googleapis.com)       [[ "$qname" =~ [Mm]utation ]] && return 0 ;;
+        cloudbuild.googleapis.com)     [[ "$qname" =~ [Oo]ther[[:space:]]API ]] && return 0 ;;
+        bigqueryreservation.googleapis.com) [[ "$qname" =~ [Cc]reateCapacityCommitment ]] && return 0 ;;
+        storage-component.googleapis.com) return 0 ;;
+        containerregistry.googleapis.com) return 0 ;;
+        monitoring.googleapis.com)    [[ "$qname" =~ [Aa]ctive[[:space:]]Alert ]] && return 0 ;;
+        pubsub.googleapis.com)        [[ "$qname" =~ [Aa]cks ]] && [[ "$qname" =~ [Mm]odify ]] && return 0 ;;
+        bigquery.googleapis.com)       [[ "$qname" =~ [Aa]lloyDB ]] && [[ "$qname" =~ [Ff]ederated ]] && return 0 ;;
+    esac
+    return 1
+}
+
+# --- Sort rows: need-attention first (by quota_per_10 asc), safe-to-ignore last ---
 sort_rows() {
     local rows="$1"
-    local sorted
-    sorted=$(echo "$rows" | grep -v '^$' | while IFS='|' read -r svc qname sku quota qper10 _; do
-        local sortkey="999999"
+    local need_attention safe_to_ignore
+    need_attention=""
+    safe_to_ignore=""
+    while IFS='|' read -r svc qname sku quota qper10 _; do
+        [[ -z "$svc" ]] && continue
+        local line="$svc|$qname|$sku|$quota|$qper10"
+        if is_safe_to_ignore "$svc" "$qname"; then
+            safe_to_ignore="${safe_to_ignore}${line}"$'\n'
+        else
+            need_attention="${need_attention}${line}"$'\n'
+        fi
+    done < <(echo "$rows" | grep -v '^$')
+
+    local sortkey sortkey_quota
+    local sort_need
+    sort_need=$(echo "$need_attention" | grep -v '^$' | while IFS='|' read -r svc qname sku quota qper10 _; do
+        sortkey="999999"
         [[ -n "$qper10" && "$qper10" != "N/A" && "$qper10" =~ ^[0-9]+$ && "$qper10" -gt 0 ]] && sortkey="$qper10"
-        local sortkey_quota="0"
+        sortkey_quota="0"
         [[ "$quota" = "unlimited" ]] && sortkey_quota="9223372036854775807"
         [[ "$quota" =~ ^[0-9]+$ ]] && sortkey_quota="$quota"
         printf '%s|%s|%s|%s|%s|%s|%s\n' "$sortkey" "$sortkey_quota" "$svc" "$qname" "$sku" "$quota" "$qper10"
     done | sort -t'|' -k1 -n -k2 -rn 2>/dev/null | cut -d'|' -f3-)
-    echo "$sorted"
+
+    local sort_safe
+    sort_safe=$(echo "$safe_to_ignore" | grep -v '^$' | while IFS='|' read -r svc qname sku quota qper10 _; do
+        sortkey="999999"
+        [[ -n "$qper10" && "$qper10" != "N/A" && "$qper10" =~ ^[0-9]+$ && "$qper10" -gt 0 ]] && sortkey="$qper10"
+        sortkey_quota="0"
+        [[ "$quota" = "unlimited" ]] && sortkey_quota="9223372036854775807"
+        [[ "$quota" =~ ^[0-9]+$ ]] && sortkey_quota="$quota"
+        printf '%s|%s|%s|%s|%s|%s|%s\n' "$sortkey" "$sortkey_quota" "$svc" "$qname" "$sku" "$quota" "$qper10"
+    done | sort -t'|' -k1 -n -k2 -rn 2>/dev/null | cut -d'|' -f3-)
+
+    { echo "$sort_need"; echo "$sort_safe"; } | grep -v '^$'
 }
 
 # --- Format and output ---
@@ -503,10 +566,17 @@ main() {
             echo "|---------|------------|--------|---------------|-------------------|"
             echo "$sorted" | while IFS='|' read -r svc qname sku quota qper10 _; do
                 [[ -z "$svc" ]] && continue
+                local svc_out qname_out
+                svc_out=$(truncate_cell "$svc" 42)
+                qname_out=$(truncate_cell "$qname" 50)
+                if ! is_safe_to_ignore "$svc" "$qname"; then
+                    svc_out="**${svc_out}**"
+                    qname_out="**${qname_out}**"
+                fi
                 printf '| %s | %s | %s | %s | %s |\n' \
-                    "$(truncate_cell "$svc" 42)" \
-                    "$(truncate_cell "$qname" 50)" \
-                    "$(truncate_cell "$sku" 55)" \
+                    "$svc_out" \
+                    "$qname_out" \
+                    "$(format_sku_cell "$sku")" \
                     "${quota:-N/A}" \
                     "${qper10:-N/A}"
             done
@@ -515,7 +585,7 @@ main() {
 
         # Print per-project table to terminal
         echo ""
-        echo "=== $pid (sorted by Quota per \$10/day, most expensive first) ==="
+        echo "=== $pid (need attention first, safe to ignore last) ==="
         echo ""
         printf "%-38s %-22s %-42s %12s %16s\n" "Service" "Quota name" "SKU(s)" "Quota" "Per \$10/day"
         echo "-------------------------------------------------------------------------------------------------------------------"
