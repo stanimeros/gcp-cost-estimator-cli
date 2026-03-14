@@ -400,6 +400,14 @@ ${api_service}|${quota_name}|${sku_combined}|${quota_val:-N/A}|${best_quota_per_
     echo "$rows"
 }
 
+# --- Truncate for width-safe table output ---
+truncate_cell() {
+    local s="$1"
+    local max="${2:-50}"
+    [[ ${#s} -le $max ]] && { echo "$s"; return; }
+    echo "${s:0:$((max - 3))}..."
+}
+
 # --- Sort rows by quota_per_10 asc (most expensive first), then quota desc ---
 sort_rows() {
     local rows="$1"
@@ -495,7 +503,12 @@ main() {
             echo "|---------|------------|--------|---------------|-------------------|"
             echo "$sorted" | while IFS='|' read -r svc qname sku quota qper10 _; do
                 [[ -z "$svc" ]] && continue
-                printf '| %s | %s | %s | %s | %s |\n' "$svc" "$qname" "${sku}" "${quota:-N/A}" "${qper10:-N/A}"
+                printf '| %s | %s | %s | %s | %s |\n' \
+                    "$(truncate_cell "$svc" 42)" \
+                    "$(truncate_cell "$qname" 50)" \
+                    "$(truncate_cell "$sku" 55)" \
+                    "${quota:-N/A}" \
+                    "${qper10:-N/A}"
             done
             echo ""
         } >> "$REPORT_FILE"
