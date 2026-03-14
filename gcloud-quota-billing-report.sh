@@ -438,30 +438,39 @@ is_non_adjustable() {
     return 1
 }
 
-# --- Check if row is "safe to ignore" (management plane, plumbing, high-limit safety) ---
-# Hides: Pub/Sub Throughput, BigQuery Slots, IAM Policy requests, Bandwidth per second, Monitoring SLOs/Services
+# --- Check if row is "safe to ignore" ---
+# 1. Metadata & IAM ($0): SetIAMPolicy, GetIAMPolicy, TestIamPermissions, Project creation, Tag updates, Repositories Get/List, Token requests
+# 2. Administrative Management: Active Alert, SLOs, Services, Dashboard, Control requests, Mutation requests
+# 3. High-Volume Performance: Pub/Sub throughput, open connections, Storage bandwidth per second
+# 4. Massive Free Tier: BigQuery Slots, recaptcha CreateAssessment, cloudtrace configuration
 is_safe_to_ignore() {
     local svc="$1"
     local qname="$2"
-    # Quota-name patterns (any service)
+    # Global patterns (any service)
     [[ "$qname" =~ [Bb]andwidth[[:space:]]per[[:space:]]second ]] && return 0
     [[ "$qname" =~ [Ii]am[Pp]olicy ]] && return 0
+    [[ "$qname" =~ [Gg]et[Ii]am[Pp]olicy ]] && return 0
     [[ "$qname" =~ [Ss]et[Ii]am[Pp]olicy ]] && return 0
+    [[ "$qname" =~ [Tt]est[Ii]am[Pp]ermissions ]] && return 0
     [[ "$qname" =~ [Ss]ervices[[:space:]]/[[:space:]]project ]] && return 0
     [[ "$qname" =~ [Ss]LOs[[:space:]]/[[:space:]]project ]] && return 0
+    [[ "$qname" =~ [Cc]ontrol[[:space:]]requests ]] && return 0
     case "$svc" in
         cloudtrace.googleapis.com)     [[ "$qname" =~ [Cc]onfiguration ]] && return 0 ;;
         eventarc.googleapis.com)       [[ "$qname" =~ [Mm]utation ]] && return 0 ;;
-        cloudbuild.googleapis.com)     [[ "$qname" =~ [Oo]ther[[:space:]]API ]] && return 0 ;;
+        cloudbuild.googleapis.com)     [[ "$qname" =~ [Oo]ther[[:space:]]API ]] || [[ "$qname" =~ [Rr]epositories ]] || [[ "$qname" =~ [Tt]oken[[:space:]]requests ]] || [[ "$qname" =~ [Gg]et/[Ll]ist ]] && return 0 ;;
         bigqueryreservation.googleapis.com) [[ "$qname" =~ [Cc]reateCapacityCommitment ]] || [[ "$qname" =~ [Ss]lots ]] && return 0 ;;
+        resourcemanager.googleapis.com) [[ "$qname" =~ [Pp]roject[[:space:]]creation ]] || [[ "$qname" =~ [Tt]ag[[:space:]]updates ]] && return 0 ;;
         storage-component.googleapis.com) return 0 ;;
         containerregistry.googleapis.com) return 0 ;;
-        monitoring.googleapis.com)    [[ "$qname" =~ [Aa]ctive[[:space:]]Alert ]] || [[ "$qname" =~ [Ss]ervices[[:space:]]/ ]] || [[ "$qname" =~ [Ss]LOs[[:space:]]/ ]] || [[ "$qname" =~ [Tt]otal[[:space:]]requests ]] || [[ "$qname" =~ [Tt]ime[[:space:]]series ]] && return 0 ;;
-        pubsub.googleapis.com)        [[ "$qname" =~ [Tt]hroughput ]] || ([[ "$qname" =~ [Aa]cks ]] && [[ "$qname" =~ [Mm]odify ]]) && return 0 ;;
+        storage.googleapis.com)       [[ "$qname" =~ [Bb]andwidth ]] && return 0 ;;
+        monitoring.googleapis.com)    [[ "$qname" =~ [Aa]ctive[[:space:]]Alert ]] || [[ "$qname" =~ [Ss]ervices[[:space:]]/ ]] || [[ "$qname" =~ [Ss]LOs[[:space:]]/ ]] || [[ "$qname" =~ [Dd]ashboard ]] || [[ "$qname" =~ [Tt]otal[[:space:]]requests ]] || [[ "$qname" =~ [Tt]ime[[:space:]]series ]] && return 0 ;;
+        logging.googleapis.com)       [[ "$qname" =~ [Cc]ontrol[[:space:]]requests ]] && return 0 ;;
+        pubsub.googleapis.com)        [[ "$qname" =~ [Tt]hroughput ]] || [[ "$qname" =~ [Oo]pen[[:space:]]connections ]] || ([[ "$qname" =~ [Aa]cks ]] && [[ "$qname" =~ [Mm]odify ]]) && return 0 ;;
         bigquery.googleapis.com)       [[ "$qname" =~ [Aa]lloyDB ]] && [[ "$qname" =~ [Ff]ederated ]] && return 0 ;;
         bigquerystorage.googleapis.com) return 0 ;;
         bigquerydatatransfer.googleapis.com) return 0 ;;
-        recaptchaenterprise.googleapis.com) return 0 ;;
+        recaptchaenterprise.googleapis.com) [[ "$qname" =~ [Cc]reateAssessment ]] || return 0 ;;
     esac
     return 1
 }
