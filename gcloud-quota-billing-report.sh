@@ -275,52 +275,8 @@ build_report_data() {
         get_quota_for_service "$api_service"
         local quota_json="${quota_result:-[]}"
 
-        # Get first quota with a value from dimensionsInfos; fallback to first quota's name when no value
-        # Output: val|name|unit|refresh (single jq pass for consistency)
-        local quota_extract tmpq
-        tmpq=$(mktemp 2>/dev/null || echo "/tmp/q_$$_$RANDOM")
-        printf '%s' "$quota_json" > "$tmpq" 2>/dev/null
-        quota_extract=$(jq -r '
-            . as $input |
-            ([.[]? | . as $q |
-              ([.dimensionsInfos[]?.details.value? | select(. != null and . != "")] | .[0]) as $v |
-              if $v != null then
-                ($v | tostring) + "|" + ($q.quotaDisplayName // $q.metricDisplayName // $q.quotaId // "Quota") + "|" + ($q.metricUnit // "") + "|" + ($q.refreshInterval // "") + "|" + (if ($q.isFixed // false) then "1" else "0" end)
-              else empty end
-            ] | .[0]) as $first |
-            if ($first != null and $first != "") then $first
-            else ($input | .[0]? | "|" + (.quotaDisplayName // .metricDisplayName // .quotaId // "Quota") + "||" + (.refreshInterval // "") + "|" + (if (.isFixed // false) then "1" else "0" end))
-            end
-        ' "$tmpq" 2>/dev/null)
-        rm -f "$tmpq"
-        local quota_val quota_name quota_unit refresh_interval is_fixed
-        quota_val="" quota_name="" quota_unit="" refresh_interval="" is_fixed="0"
-        if [[ -n "$quota_extract" ]]; then
-            quota_val=$(echo "$quota_extract" | cut -d'|' -f1)
-            quota_name=$(echo "$quota_extract" | cut -d'|' -f2)
-            quota_unit=$(echo "$quota_extract" | cut -d'|' -f3)
-            refresh_interval=$(echo "$quota_extract" | cut -d'|' -f4)
-            is_fixed=$(echo "$quota_extract" | cut -d'|' -f5)
-            [[ -z "$quota_val" && "$quota_extract" = "|"* ]] && quota_name=$(echo "$quota_extract" | cut -d'|' -f2)
-        fi
-        if [[ -n "$refresh_interval" ]]; then
-            local suffix=""
-            case "$refresh_interval" in
-                minute) suffix="per minute" ;;
-                day) suffix="per day" ;;
-                second) suffix="per second" ;;
-                *) suffix="per ${refresh_interval}" ;;
-            esac
-            local qname_lower
-            qname_lower=$(echo "$quota_name" | tr '[:upper:]' '[:lower:]')
-            [[ -n "$suffix" && "$qname_lower" != *"$suffix"* ]] && quota_name="${quota_name} ${suffix}"
-        fi
-        [[ "$quota_val" = "-1" ]] && quota_val="unlimited"
-        [[ "$quota_val" = "9223372036854775807" ]] && quota_val="unlimited"
-
-        # Aggregate SKUs per service
+        # Aggregate SKUs per service (once; reused for all quotas)
         local sku_descs=()
-        # quota_per_10: units you can consume for $10/day (from most expensive SKU)
         local best_quota_per_10="N/A"
         local idx=0
         while read -r sku; do
@@ -339,38 +295,30 @@ build_report_data() {
 
             sku_descs+=("$sku_desc")
 
-            # Quota per $10/day: how many units $10 buys per day (based purely on SKU price+unit)
-            # usageUnit values seen in practice: h, GiBy, GiBy.mo, GiBy.h, GiBy.s, GiBy.d,
-            #   TiBy, MiBy, GBy.h, count, mo, min, s, ms, request, 1000, 1k
-            # Use bc -l for floating point; printf "%.0f" rounds to integer for validation.
             local quota_per_10=""
             if [[ -n "$unit_price" && "$unit_price" != "0" ]]; then
                 local raw_val=""
                 local u="$usage_unit"
                 case "$u" in
                     h|*Hour*)            raw_val=$(echo "10 / ($unit_price * 24)" | bc -l 2>/dev/null) ;;
-                    GiBy.mo|TiBy.mo|MiBy.mo|mo) raw_val=$(echo "300 / $unit_price" | bc -l 2>/dev/null) ;;  # $10/day = $300/mo
+                    GiBy.mo|TiBy.mo|MiBy.mo|mo) raw_val=$(echo "300 / $unit_price" | bc -l 2>/dev/null) ;;
                     GiBy.h|GBy.h)        raw_val=$(echo "10 / ($unit_price * 24)" | bc -l 2>/dev/null) ;;
                     GiBy.s|GBy.s)        raw_val=$(echo "10 / ($unit_price * 86400)" | bc -l 2>/dev/null) ;;
                     GiBy.d)              raw_val=$(echo "10 / $unit_price" | bc -l 2>/dev/null) ;;
-                    GiBy|GBy)            raw_val=$(echo "300 / $unit_price" | bc -l 2>/dev/null) ;;         # storage, monthly
+                    GiBy|GBy)            raw_val=$(echo "300 / $unit_price" | bc -l 2>/dev/null) ;;
                     TiBy)                raw_val=$(echo "300 / $unit_price" | bc -l 2>/dev/null) ;;
-                    MiBy)                raw_val=$(echo "300 * 1024 / $unit_price" | bc -l 2>/dev/null) ;;  # MiBy.mo → more units
+                    MiBy)                raw_val=$(echo "300 * 1024 / $unit_price" | bc -l 2>/dev/null) ;;
                     min)                 raw_val=$(echo "10 / ($unit_price * 1440)" | bc -l 2>/dev/null) ;;
                     s|ms)                raw_val=$(echo "10 / ($unit_price * 86400)" | bc -l 2>/dev/null) ;;
                     count|1)             raw_val=$(echo "10 / $unit_price" | bc -l 2>/dev/null) ;;
                     *request*|*1000*|*1k*) raw_val=$(echo "10 * 1000 / $unit_price" | bc -l 2>/dev/null) ;;
                     *)                   raw_val=$(echo "10 / $unit_price" | bc -l 2>/dev/null) ;;
                 esac
-                # Round to integer; handles .45, 0.45, 1e5, etc.
-                if [[ -n "$raw_val" ]]; then
-                    quota_per_10=$(printf "%.0f" "$raw_val" 2>/dev/null || echo "")
-                fi
+                [[ -n "$raw_val" ]] && quota_per_10=$(printf "%.0f" "$raw_val" 2>/dev/null || echo "")
             fi
             quota_per_10=$(echo "$quota_per_10" | tr -d ' \n\r')
             [[ -z "$quota_per_10" || "$quota_per_10" = "0" ]] && quota_per_10="N/A"
 
-            # quota_per_10 from most expensive SKU (lowest value = tightest budget)
             local q10_int
             q10_int=$(echo "$quota_per_10" | sed 's/^\([0-9]*\).*/\1/' | tr -d '\n')
             if [[ -n "$q10_int" && "$q10_int" =~ ^[0-9]+$ && "$q10_int" -gt 0 ]]; then
@@ -383,17 +331,49 @@ build_report_data() {
 
         rm -f "$tmp_skus"
         [[ ${#sku_descs[@]} -eq 0 ]] && continue
-        [[ -z "$quota_name" ]] && quota_name="Quota"
-        is_non_adjustable "$api_service" "$quota_name" "$is_fixed" && continue
-        report_services=$((report_services + 1))
-        report_skus=$((report_skus + ${#sku_descs[@]}))
+
         local sku_combined
         sku_combined=$(IFS=', '; echo "${sku_descs[*]}")
-        if [[ ${#sku_combined} -gt 80 ]]; then
-            sku_combined="${sku_combined:0:77}..."
-        fi
-        rows="${rows}
+        [[ ${#sku_combined} -gt 80 ]] && sku_combined="${sku_combined:0:77}..."
+
+        # Output one row per quota (all quotas for this service)
+        local tmpq rows_added=0
+        tmpq=$(mktemp 2>/dev/null || echo "/tmp/q_$$_$RANDOM")
+        printf '%s' "$quota_json" > "$tmpq" 2>/dev/null
+        while IFS='|' read -r quota_val quota_name quota_unit refresh_interval is_fixed; do
+            [[ -z "$quota_name" ]] && quota_name="Quota"
+            [[ -z "$quota_val" && "${quota_val:-x}" != "x" ]] && quota_val=""
+            if [[ -n "$refresh_interval" ]]; then
+                local suffix=""
+                case "$refresh_interval" in
+                    minute) suffix="per minute" ;;
+                    day) suffix="per day" ;;
+                    second) suffix="per second" ;;
+                    *) suffix="per ${refresh_interval}" ;;
+                esac
+                local qname_lower
+                qname_lower=$(echo "$quota_name" | tr '[:upper:]' '[:lower:]')
+                [[ -n "$suffix" && "$qname_lower" != *"$suffix"* ]] && quota_name="${quota_name} ${suffix}"
+            fi
+            [[ "$quota_val" = "-1" ]] && quota_val="unlimited"
+            [[ "$quota_val" = "9223372036854775807" ]] && quota_val="unlimited"
+            is_non_adjustable "$api_service" "$quota_name" "$is_fixed" && continue
+            report_services=$((report_services + 1))
+            rows_added=$((rows_added + 1))
+            rows="${rows}
 ${api_service}|${quota_name}|${sku_combined}|${quota_val:-N/A}|${best_quota_per_10}|"
+        done < <(jq -r '
+            . as $input |
+            if ($input | type) == "array" then
+                ($input[]? | . as $q |
+                  ([.dimensionsInfos[]?.details.value? | select(. != null and . != "")] | .[0]) as $v |
+                  (($v | tostring) // "") + "|" + ($q.quotaDisplayName // $q.metricDisplayName // $q.quotaId // "Quota") + "|" + ($q.metricUnit // "") + "|" + ($q.refreshInterval // "") + "|" + (if ($q.isFixed // false) then "1" else "0" end)
+                )
+            else empty
+            end
+        ' "$tmpq" 2>/dev/null)
+        rm -f "$tmpq"
+        [[ $rows_added -gt 0 ]] && report_skus=$((report_skus + ${#sku_descs[@]}))
     done
 
     # Save quota cache for next run — copy TMP_QUOTA_CACHE to disk if valid and non-empty
