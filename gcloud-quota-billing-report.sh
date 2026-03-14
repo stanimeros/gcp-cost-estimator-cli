@@ -285,30 +285,35 @@ build_report_data() {
             ([.[]? | . as $q |
               ([.dimensionsInfos[]?.details.value? | select(. != null and . != "")] | .[0]) as $v |
               if $v != null then
-                ($v | tostring) + "|" + ($q.quotaDisplayName // $q.metricDisplayName // $q.quotaId // "Quota") + "|" + ($q.metricUnit // "") + "|" + ($q.refreshInterval // "")
+                ($v | tostring) + "|" + ($q.quotaDisplayName // $q.metricDisplayName // $q.quotaId // "Quota") + "|" + ($q.metricUnit // "") + "|" + ($q.refreshInterval // "") + "|" + (if ($q.isFixed // false) then "1" else "0" end)
               else empty end
             ] | .[0]) as $first |
             if ($first != null and $first != "") then $first
-            else ($input | .[0]? | "|" + (.quotaDisplayName // .metricDisplayName // .quotaId // "Quota") + "||" + (.refreshInterval // ""))
+            else ($input | .[0]? | "|" + (.quotaDisplayName // .metricDisplayName // .quotaId // "Quota") + "||" + (.refreshInterval // "") + "|" + (if (.isFixed // false) then "1" else "0" end))
             end
         ' "$tmpq" 2>/dev/null)
         rm -f "$tmpq"
-        local quota_val quota_name quota_unit refresh_interval
-        quota_val="" quota_name="" quota_unit="" refresh_interval=""
+        local quota_val quota_name quota_unit refresh_interval is_fixed
+        quota_val="" quota_name="" quota_unit="" refresh_interval="" is_fixed="0"
         if [[ -n "$quota_extract" ]]; then
             quota_val=$(echo "$quota_extract" | cut -d'|' -f1)
             quota_name=$(echo "$quota_extract" | cut -d'|' -f2)
             quota_unit=$(echo "$quota_extract" | cut -d'|' -f3)
             refresh_interval=$(echo "$quota_extract" | cut -d'|' -f4)
+            is_fixed=$(echo "$quota_extract" | cut -d'|' -f5)
             [[ -z "$quota_val" && "$quota_extract" = "|"* ]] && quota_name=$(echo "$quota_extract" | cut -d'|' -f2)
         fi
         if [[ -n "$refresh_interval" ]]; then
+            local suffix=""
             case "$refresh_interval" in
-                minute) quota_name="${quota_name} per minute" ;;
-                day) quota_name="${quota_name} per day" ;;
-                second) quota_name="${quota_name} per second" ;;
-                *) quota_name="${quota_name} per ${refresh_interval}" ;;
+                minute) suffix="per minute" ;;
+                day) suffix="per day" ;;
+                second) suffix="per second" ;;
+                *) suffix="per ${refresh_interval}" ;;
             esac
+            local qname_lower
+            qname_lower=$(echo "$quota_name" | tr '[:upper:]' '[:lower:]')
+            [[ -n "$suffix" && "$qname_lower" != *"$suffix"* ]] && quota_name="${quota_name} ${suffix}"
         fi
         [[ "$quota_val" = "-1" ]] && quota_val="unlimited"
         [[ "$quota_val" = "9223372036854775807" ]] && quota_val="unlimited"
@@ -378,6 +383,8 @@ build_report_data() {
 
         rm -f "$tmp_skus"
         [[ ${#sku_descs[@]} -eq 0 ]] && continue
+        [[ -z "$quota_name" ]] && quota_name="Quota"
+        is_non_adjustable "$api_service" "$quota_name" "$is_fixed" && continue
         report_services=$((report_services + 1))
         report_skus=$((report_skus + ${#sku_descs[@]}))
         local sku_combined
@@ -385,7 +392,6 @@ build_report_data() {
         if [[ ${#sku_combined} -gt 80 ]]; then
             sku_combined="${sku_combined:0:77}..."
         fi
-        [[ -z "$quota_name" ]] && quota_name="Quota"
         rows="${rows}
 ${api_service}|${quota_name}|${sku_combined}|${quota_val:-N/A}|${best_quota_per_10}|"
     done
@@ -426,6 +432,18 @@ format_sku_cell() {
         ((count++)) || true
     done < <(echo "$sku" | tr ',' '\n')
     echo "${result:-$sku}"
+}
+
+# --- Check if quota is non-adjustable (user cannot change it; skip from report) ---
+is_non_adjustable() {
+    local svc="$1"
+    local qname="$2"
+    local is_fixed="$3"
+    [[ "$is_fixed" = "1" || "$is_fixed" = "true" ]] && return 0
+    case "$svc" in
+        storage.googleapis.com) [[ "$qname" =~ [Aa]nywhere[[:space:]]Cache ]] && return 0 ;;
+    esac
+    return 1
 }
 
 # --- Check if row is "safe to ignore" (management plane, plumbing, high-limit safety) ---
@@ -599,50 +617,11 @@ main() {
         done
     done
 
-    # Append summary footer and "Safe to ignore" section
+    # Append summary footer
     {
         echo "---"
         echo ""
         echo "**Total services** $total_services, **Total SKUs** $total_skus"
-        echo ""
-        echo "---"
-        echo ""
-        echo "## Safe to ignore"
-        echo ""
-        echo "These entries often appear at the end of the list (low Quota per \$10/day) but are typically false positives or high-limit safety quotas."
-        echo ""
-        echo "### 1. Management Plane"
-        echo ""
-        echo "APIs that manage configurations rather than data. High quotas ensure deployment tools (e.g. Terraform) don't get blocked."
-        echo ""
-        echo "- **cloudtrace.googleapis.com** (Read configuration requests): Reading settings, not tracing data. Free and not monetizable."
-        echo "- **eventarc.googleapis.com** (Mutation requests): Creating/deleting triggers, not events. Unless you constantly recreate triggers, you won't pay."
-        echo "- **cloudbuild.googleapis.com** (Other API requests): List builds, get status. Cost is in build minutes, not these calls."
-        echo "- **bigqueryreservation.googleapis.com** (CreateCapacityCommitment): Buying \$10k/month slots programmatically. False positive unless you do this every minute."
-        echo ""
-        echo "### 2. Infrastructure Plumbing"
-        echo ""
-        echo "Standard system limits that don't directly correlate to high costs."
-        echo ""
-        echo "- **storage-component.googleapis.com**: Pass-through for internal GCS. Billed for storage/egress, not these API calls."
-        echo "- **containerregistry.googleapis.com**: Old registry plumbing. Cost is in image storage, not registry API quota."
-        echo "- **monitoring.googleapis.com** (Active Alert Conditions): 80k alert quota. You pay for active checks (cents/month); high quota is harmless."
-        echo ""
-        echo "### 3. High-Limit Safety Quotas"
-        echo ""
-        echo "GCP gives massive head-room for extreme scale."
-        echo ""
-        echo "- **pubsub.googleapis.com** (Acks and modify acks): 48GB/min is a high water mark. You pay for message throughput."
-        echo "- **bigquery.googleapis.com** (AlloyDB federated query cross region): 1TB/day. Limit prevents network congestion; cost shows in BigQuery bill before quota."
-        echo ""
-        echo "### 4. High Throughput, Low Billing Risk"
-        echo ""
-        echo "Even with high throughput, these are almost never the source of a billing surprise."
-        echo ""
-        echo "- **bigquerystorage.googleapis.com**: Speed limit for moving data. You are billed for the data itself; this quota doesn't need monitoring."
-        echo "- **bigquerydatatransfer.googleapis.com**: API calls to set up a transfer. Almost always negligible."
-        echo "- **recaptchaenterprise.googleapis.com**: 1 million free assessments/month. Unlimited quota is standard; you'd need to be a massive target for it to cost you."
-        echo ""
     } >> "$REPORT_FILE"
 
     echo ""
