@@ -438,40 +438,80 @@ is_non_adjustable() {
     return 1
 }
 
-# --- Check if row is "safe to ignore" ---
-# 1. Metadata & IAM ($0): SetIAMPolicy, GetIAMPolicy, TestIamPermissions, Project creation, Tag updates, Repositories Get/List, Token requests
-# 2. Administrative Management: Active Alert, SLOs, Services, Dashboard, Control requests, Mutation requests
-# 3. High-Volume Performance: Pub/Sub throughput, open connections, Storage bandwidth per second
-# 4. Massive Free Tier: BigQuery Slots, recaptcha CreateAssessment, cloudtrace configuration
+# --- Check if row is "safe to ignore" (Administrative & High-Ceiling false positives) ---
+# Goal: ~10 True Positives (GenerateContent parent, AutocompletePlaces, Log write bytes, Query usage per day)
+# 1. Metadata & Administrative: SetIAMPolicy, GetIAMPolicy, TestIamPermissions, List, Get, Operation, Metadata, Control requests, Mutation
+# 2. High-Ceiling: Pub/Sub throughput/connections, Storage bandwidth, BigQuery Python UDF/Extract/Tabledata list
+# 3. AI/LLM: generativelanguage - KEEP ONLY "Request limit per minute for a region", hide limit per model, Search Grounding, Image Verification, Batch Active, File storage
+# 4. Large Free Tier: recaptcha CreateAssessment, firebasehosting (all)
+# --- Corrected logic: return 0 to HIDE, return 1 to SHOW ---
 is_safe_to_ignore() {
     local svc="$1"
     local qname="$2"
-    # Global patterns (any service)
-    [[ "$qname" =~ [Bb]andwidth[[:space:]]per[[:space:]]second ]] && return 0
-    [[ "$qname" =~ [Ii]am[Pp]olicy ]] && return 0
-    [[ "$qname" =~ [Gg]et[Ii]am[Pp]olicy ]] && return 0
-    [[ "$qname" =~ [Ss]et[Ii]am[Pp]olicy ]] && return 0
-    [[ "$qname" =~ [Tt]est[Ii]am[Pp]ermissions ]] && return 0
-    [[ "$qname" =~ [Ss]ervices[[:space:]]/[[:space:]]project ]] && return 0
-    [[ "$qname" =~ [Ss]LOs[[:space:]]/[[:space:]]project ]] && return 0
-    [[ "$qname" =~ [Cc]ontrol[[:space:]]requests ]] && return 0
+
+    # 1. Immediate Silence (Services that are 100% plumbing/DDoS/Free)
     case "$svc" in
-        cloudtrace.googleapis.com)     [[ "$qname" =~ [Cc]onfiguration ]] && return 0 ;;
-        eventarc.googleapis.com)       [[ "$qname" =~ [Mm]utation ]] && return 0 ;;
-        cloudbuild.googleapis.com)     [[ "$qname" =~ [Oo]ther[[:space:]]API ]] || [[ "$qname" =~ [Rr]epositories ]] || [[ "$qname" =~ [Tt]oken[[:space:]]requests ]] || [[ "$qname" =~ [Gg]et/[Ll]ist ]] && return 0 ;;
-        bigqueryreservation.googleapis.com) [[ "$qname" =~ [Cc]reateCapacityCommitment ]] || [[ "$qname" =~ [Ss]lots ]] && return 0 ;;
-        resourcemanager.googleapis.com) [[ "$qname" =~ [Pp]roject[[:space:]]creation ]] || [[ "$qname" =~ [Tt]ag[[:space:]]updates ]] && return 0 ;;
-        storage-component.googleapis.com) return 0 ;;
-        containerregistry.googleapis.com) return 0 ;;
-        storage.googleapis.com)       [[ "$qname" =~ [Bb]andwidth ]] && return 0 ;;
-        monitoring.googleapis.com)    [[ "$qname" =~ [Aa]ctive[[:space:]]Alert ]] || [[ "$qname" =~ [Ss]ervices[[:space:]]/ ]] || [[ "$qname" =~ [Ss]LOs[[:space:]]/ ]] || [[ "$qname" =~ [Dd]ashboard ]] || [[ "$qname" =~ [Tt]otal[[:space:]]requests ]] || [[ "$qname" =~ [Tt]ime[[:space:]]series ]] && return 0 ;;
-        logging.googleapis.com)       [[ "$qname" =~ [Cc]ontrol[[:space:]]requests ]] && return 0 ;;
-        pubsub.googleapis.com)        [[ "$qname" =~ [Tt]hroughput ]] || [[ "$qname" =~ [Oo]pen[[:space:]]connections ]] || ([[ "$qname" =~ [Aa]cks ]] && [[ "$qname" =~ [Mm]odify ]]) && return 0 ;;
-        bigquery.googleapis.com)       [[ "$qname" =~ [Aa]lloyDB ]] && [[ "$qname" =~ [Ff]ederated ]] && return 0 ;;
-        bigquerystorage.googleapis.com) return 0 ;;
+        firebasehosting.googleapis.com)      return 0 ;;
+        cloudtrace.googleapis.com)           return 0 ;;
+        cloudbuild.googleapis.com)           return 0 ;;
+        monitoring.googleapis.com)           return 0 ;;
+        pubsub.googleapis.com)               return 0 ;;
+        bigquerystorage.googleapis.com)      return 0 ;;
         bigquerydatatransfer.googleapis.com) return 0 ;;
-        recaptchaenterprise.googleapis.com) [[ "$qname" =~ [Cc]reateAssessment ]] || return 0 ;;
+        recaptchaenterprise.googleapis.com)  return 0 ;;
+        storage-component.googleapis.com)    return 0 ;;
+        containerregistry.googleapis.com)    return 0 ;;
+        resourcemanager.googleapis.com)      return 0 ;;
+        bigqueryreservation.googleapis.com)  return 0 ;;
+        eventarc.googleapis.com)             return 0 ;;
     esac
+
+    # 2. Global Noise Filter (IAM, Metadata, Admin)
+    [[ "$qname" =~ [Ii][Aa][Mm][Pp]olicy ]] && return 0
+    [[ "$qname" =~ [Tt]est[Ii][Aa][Mm][Pp]ermissions ]] && return 0
+    [[ "$qname" =~ [Mm]etadata ]] && return 0
+    [[ "$qname" =~ [Cc]ontrol[[:space:]]requests ]] && return 0
+    [[ "$qname" =~ [Mm]utation ]] && return 0
+    [[ "$qname" =~ [Gg]et[[:space:]][Oo]peration ]] && return 0
+    [[ "$qname" =~ [Gg]et/[Ll]ist ]] && return 0
+
+    # 3. AI/LLM: Keep ONLY the Regional Parent
+    if [[ "$svc" = "generativelanguage.googleapis.com" ]]; then
+        # Match "Request limit per minute for a region" exactly
+        if [[ "$qname" =~ ^[Rr]equest[[:space:]]limit[[:space:]]per[[:space:]]minute[[:space:]]for[[:space:]]a[[:space:]]region$ ]]; then
+            return 1 # SHOW
+        fi
+        return 0 # HIDE all other Gemini variants
+    fi
+
+    # 4. Service-Specific Noise Reduction
+    case "$svc" in
+        bigquery.googleapis.com)
+            # Hide technicalities, Keep ONLY "Query usage per day"
+            [[ "$qname" =~ ^[Qq]uery[[:space:]]usage[[:space:]]per[[:space:]]day$ ]] && return 1
+            return 0
+            ;;
+        places.googleapis.com)
+            # Hide "per minute" speed limits, Keep ONLY "per day" money limits
+            [[ "$qname" =~ [Pp]er[[:space:]]minute ]] && return 0
+            return 1 # SHOW Autocomplete/Search/Photo per day
+            ;;
+        storage.googleapis.com)
+            # Hide Bandwidth/Egress (Speed), the bill is the Total GB (Usage)
+            [[ "$qname" =~ [Bb]andwidth ]] && return 0
+            [[ "$qname" =~ [Ee]gress ]] && return 0
+            [[ "$qname" =~ [Ii]ngress ]] && return 0
+            return 0 # Hide the rest of storage noise
+            ;;
+        artifactregistry.googleapis.com)
+            # Hide noise, Keep ONLY Delete (Cleanup tracking) or Write (Cost tracking)
+            [[ "$qname" =~ [Ww]rite ]] && return 1
+            [[ "$qname" =~ [Dd]elete ]] && return 1
+            return 0
+            ;;
+    esac
+
+    # Default: Show anything else that made it through the filters
     return 1
 }
 
