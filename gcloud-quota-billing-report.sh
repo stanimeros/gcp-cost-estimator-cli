@@ -513,11 +513,42 @@ main() {
         done
     done
 
-    # Append summary footer to report
+    # Append summary footer and "Safe to ignore" section
     {
         echo "---"
         echo ""
         echo "**Total services** $total_services, **Total SKUs** $total_skus"
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Safe to ignore"
+        echo ""
+        echo "These entries often appear at the end of the list (low Quota per \$10/day) but are typically false positives or high-limit safety quotas."
+        echo ""
+        echo "### 1. Management Plane"
+        echo ""
+        echo "APIs that manage configurations rather than data. High quotas ensure deployment tools (e.g. Terraform) don't get blocked."
+        echo ""
+        echo "- **cloudtrace.googleapis.com** (Read configuration requests): Reading settings, not tracing data. Free and not monetizable."
+        echo "- **eventarc.googleapis.com** (Mutation requests): Creating/deleting triggers, not events. Unless you constantly recreate triggers, you won't pay."
+        echo "- **cloudbuild.googleapis.com** (Other API requests): List builds, get status. Cost is in build minutes, not these calls."
+        echo "- **bigqueryreservation.googleapis.com** (CreateCapacityCommitment): Buying \$10k/month slots programmatically. False positive unless you do this every minute."
+        echo ""
+        echo "### 2. Infrastructure Plumbing"
+        echo ""
+        echo "Standard system limits that don't directly correlate to high costs."
+        echo ""
+        echo "- **storage-component.googleapis.com**: Pass-through for internal GCS. Billed for storage/egress, not these API calls."
+        echo "- **containerregistry.googleapis.com**: Old registry plumbing. Cost is in image storage, not registry API quota."
+        echo "- **monitoring.googleapis.com** (Active Alert Conditions): 80k alert quota. You pay for active checks (cents/month); high quota is harmless."
+        echo ""
+        echo "### 3. High-Limit Safety Quotas"
+        echo ""
+        echo "GCP gives massive head-room for extreme scale."
+        echo ""
+        echo "- **pubsub.googleapis.com** (Acks and modify acks): 48GB/min is a high water mark. You pay for message throughput."
+        echo "- **bigquery.googleapis.com** (AlloyDB federated query cross region): 1TB/day. Limit prevents network congestion; cost shows in BigQuery bill before quota."
+        echo ""
     } >> "$REPORT_FILE"
 
     echo ""
