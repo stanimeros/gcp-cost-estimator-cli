@@ -64,12 +64,11 @@ The value is shown as **N/A** when:
 
 ## Cache
 
-Billing catalog (services + SKUs) and quota data are cached for 24h in `.cache/` (in the script folder):
+Billing catalog (services + SKUs) and quota data are cached in `.cache/` (in the script folder). On subsequent runs, cached data is reused and `curl` / `gcloud beta quotas` calls are skipped. Only `gcloud projects list`, `gcloud beta billing projects describe`, and `gcloud services list` are called live each run.
 
-- `CACHE_TTL=0` – disable cache
-- `CACHE_DIR=/custom/path` – use a different folder
+To refetch: delete the cache folder (`rm -rf .cache/`).
 
-On subsequent runs within 24h, all `curl` and `gcloud beta quotas` calls are skipped. Only `gcloud projects list`, `gcloud beta billing projects describe`, and `gcloud services list` are called live each run.
+- `CACHE_DIR=/custom/path` – use a different cache folder
 
 ## Execution Cost
 

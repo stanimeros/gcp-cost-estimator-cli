@@ -12,10 +12,9 @@ set -euo pipefail
 
 # --- Configuration ---
 REPORT_FILE="billing-report.md"
-# Cache: in script folder (.cache/), TTL 24h. Set CACHE_TTL=0 to disable.
+# Cache: in script folder (.cache/). Delete .cache/ to refetch.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CACHE_DIR="${CACHE_DIR:-${SCRIPT_DIR}/.cache}"
-CACHE_TTL="${CACHE_TTL:-86400}"
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -49,24 +48,17 @@ check_prerequisites() {
 }
 
 # --- Cache helpers ---
-# Returns cached content if fresh, else empty. Usage: cached="$(cache_get "key")"
+# Returns cached content if present, else empty. Usage: cached="$(cache_get "key")"
 cache_get() {
     local key="$1"
     local file="${CACHE_DIR}/${key}.json"
-    [[ "$CACHE_TTL" -le 0 ]] && return 1
     [[ -f "$file" ]] || return 1
-    local age
-    local mtime
-    mtime=$(stat -f %m "$file" 2>/dev/null) || mtime=$(stat -c %Y "$file" 2>/dev/null)
-    age=$(($(date +%s) - ${mtime:-0}))
-    [[ "$age" -lt "$CACHE_TTL" ]] || return 1
     cat "$file" 2>/dev/null
 }
 
 cache_set() {
     local key="$1"
     local content="$2"
-    [[ "$CACHE_TTL" -le 0 ]] && return
     mkdir -p "$CACHE_DIR"
     echo "$content" > "${CACHE_DIR}/${key}.json" 2>/dev/null
 }
@@ -76,7 +68,7 @@ billing_get_services() {
     local cached
     cached=$(cache_get "billing_services")
     if [[ -n "$cached" ]]; then
-        log_info "Billing catalog: from cache (TTL ${CACHE_TTL}s)"
+        log_info "Billing catalog: from cache"
         echo "$cached"
         return
     fi
